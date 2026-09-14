@@ -1,0 +1,29 @@
+# Normalise line endings inside the repository; check out native on Windows.
+* text=auto
+
+# ---- Notebook output stripping -------------------------------------------
+# This file is committed, but the filter DEFINITION lives in .git/config and
+# is NOT. On every machine you must run, once per clone:
+#
+#   pip install nbstripout
+#   where.exe nbstripout            # note the path
+#   git config filter.nbstripout.clean  "<abs/path/to/nbstripout.exe>"
+#   git config filter.nbstripout.smudge cat
+#   git config filter.nbstripout.required true
+#   git config diff.ipynb.textconv "<abs/path/to/nbstripout.exe> -t"
+#
+# Until you do, committing a .ipynb will fail loudly. That is deliberate:
+# silently committing megabytes of base64 figure output is the worse failure.
+*.ipynb filter=nbstripout
+*.ipynb diff=ipynb
+
+# ---- Binary: never diff, never line-ending-normalise ----
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.h5 binary
+*.npy binary
+*.npz binary
+*.pt binary
+*.pth binary
