@@ -1,0 +1,99 @@
+# ===========================================================================
+# neuralgeom
+# Rule: source and small text assets are tracked. Data, generated artefacts,
+# environments, and private notes are not.
+# ===========================================================================
+
+# ---- Python build / cache ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Environments ----
+.venv/
+venv/
+env/
+
+# ---- Notebooks ----
+.ipynb_checkpoints/
+
+# ---- Data: never commit ----
+SampleData/
+/data/
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.mat
+*.nwb
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.parquet
+*.feather
+# NOTE: *.csv is deliberately NOT ignored. Small parameter tables (channel
+# maps, session lists) are worth versioning. Add an explicit rule here if you
+# ever drop a large data CSV into the tree.
+
+# ---- Generated artefacts ----
+# paths.py recreates these on import, so they need not be tracked.
+outputs/
+docs/rendered/
+
+# Training-run output. `runs/` currently holds 2.1 GB of figures, trial
+# records and weights, all of it reproducible from the code plus the variant
+# name. Ignore the whole directory rather than listing extensions: the run
+# writes .png, .json, .npz and .pt side by side and a new one appears every
+# time the report grows a panel.
+runs/
+runs_*/
+*_records.json
+*_hist.json
+*_states.npz
+*_model.pt
+
+# Superseded notes staged for deletion.
+docs/_to_delete/
+
+# ---- Machine-local configuration ----
+data_dir.local
+config.local.*
+.env
+
+# ---- Local-only prose: stays on disk, never pushed ----
+# README.md is the ONLY tracked prose document. The .tex files under docs/ are
+# tracked (they are the formal mathematics). Everything below stays local:
+# it is either unpublished, superseded, machine-specific, or merge archaeology
+# that a reader of the repository has no use for.
+docs/PROJECTIVE_RESULTS.md
+docs/PROJECTIVE_ROADMAP.md
+docs/PULLBACK_HANDOFF.md
+docs/PROJECTIVE_HANDOFF.md
+docs/PBGEOM_MIGRATION_V04.md
+docs/MERGE_NOTES.md
+docs/DROPPED.md
+HANDOFF.md
+CLAUDE.md
+ENVIRONMENT.md
+# NOTE: examples/README.md IS tracked -- it documents the notebooks, it is not
+# one of the handoff documents.
+
+# ---- Housekeeping ----
+.prepatch_backup/
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/settings.json
+.idea/
+
+# --- timingtask ---------------------------------------------------------
+runs/
+*.h5
