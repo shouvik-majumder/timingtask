@@ -41,8 +41,7 @@ out by a policy head (a lick probability per 20 ms step) and a value head.
 Trained by REINFORCE with a learned baseline over 16 parallel environments, each
 running its own copy of the task and its own curriculum.
 
-See `current-focus.md` for where the science actually stands, and
-`docs/timing_rl_formulation.tex` for the equations.
+See `docs/timing_rl_formulation.tex` for the equations.
 
 ## Install
 
@@ -81,7 +80,7 @@ timingtask/
   export.py      states + behaviour → Trajectory HDF5   ← the seam
 
 tests/     153 tests; `-m "not slow"` skips the one that trains a network
-docs/      the formulation, the model inventory, the generated config reference
+docs/      the formulation and the generated config reference
 examples/  timing_debug.py (step-by-step trial inspection and a supervised run, as
            `# %%` cells) and timing_rnn.ipynb (supervised and RL training walkthrough)
 ```
