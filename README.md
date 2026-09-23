@@ -82,6 +82,8 @@ timingtask/
 
 tests/     153 tests; `-m "not slow"` skips the one that trains a network
 docs/      the formulation, the model inventory, the generated config reference
+examples/  timing_debug.py (step-by-step trial inspection and a supervised run, as
+           `# %%` cells) and timing_rnn.ipynb (supervised and RL training walkthrough)
 ```
 
 ## Run it
