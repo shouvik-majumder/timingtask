@@ -159,3 +159,7 @@ attach its per-trial series with `rl.attach_states` (or the same key names) so
 three times inline, and two of the three copies quietly omitted the hidden
 states, so `collect_states=True` returned nothing usable from `switching_test`
 and `probe`.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
