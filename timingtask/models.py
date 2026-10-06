@@ -1,37 +1,24 @@
 """
-timingtask.models — the agent zoo: recurrent cores behind one interface.
-========================================================================
+timingtask.models: recurrent network models.
 
-This is where new agent architectures go. Everything in this repository
-that trains something — ``rl.RLTrainer`` (REINFORCE), ``training.train``
-(supervised) — takes a core from here and never names a class, so adding
-an architecture means adding it to this module and to ``MODELS``, and
-nothing else has to change.
-
-``ActorCritic`` in ``rl.py`` wraps any of these and bolts a policy head
-and a value head on; the core’s ``step`` stays a pure function either way.
-
-Every model implements:
+Every model implements the same interface:
 
     out, H = model(inputs)          # (B,T,in) -> (B,T,out), (B,T,hidden)
-    h1     = model.step(x_t, h)     # ONE step: (B,in), (B,hidden) -> (B,hidden)
+    h1     = model.step(x_t, h)     # one step: (B,in), (B,hidden) -> (B,hidden)
     y      = model.readout(h)       # (B,hidden) -> (B,out)
     model.hidden_size, model.state_is_tuple
 
-``step`` is the important one for geometry: it is a pure function of
-(x, h) with no side effects, so ``torch.func`` can take Jacobians of it —
-that is what turns the pullback-metric machinery loose on the *dynamics*
-(recurrent Jacobian dh_{t+1}/dh_t) rather than just a feedforward map.
+``step`` is a pure function of ``(x, h)`` with no side effects, so Jacobians
+of the dynamics can be taken with ``torch.func``. The trainers in
+:mod:`timingtask.rl` and :mod:`timingtask.training` accept any model with this
+interface, and :class:`~timingtask.rl.ActorCritic` wraps any of them as the
+recurrent core of an agent.
 
-VanillaRNN is the standard continuous-time ("leaky") tanh RNN used in
-systems neuroscience:
+:class:`VanillaRNN` is the continuous-time ("leaky") tanh network standard in
+computational neuroscience:
 
     h_{t+1} = (1 - alpha) h_t + alpha * tanh(W_rec h_t + W_in x_t + b + noise)
     alpha   = dt / tau
-
-with alpha < 1 giving the network an intrinsic time constant. Private
-noise during training is what makes solutions robust (and produces the
-attractor structure the analysis module looks for).
 """
 from __future__ import annotations
 
@@ -80,16 +67,23 @@ class _BaseRNN(nn.Module):
 
 
 class VanillaRNN(_BaseRNN):
-    """Leaky tanh RNN (continuous-time discretization).
+    """Leaky tanh RNN (forward-Euler discretisation of a continuous-time
+    rate network).
 
     Parameters
     ----------
-    tau : membrane time constant (ms); alpha = dt / tau
-    dt : integration step (ms) — should match the task's dt
-    noise : SD of private recurrent noise (scaled by sqrt(2*alpha)); set to
-        0.0 (or call ``model.eval()``) for deterministic analysis
-    rec_init : "gaussian" (chaotic-ish, g/sqrt(N)) or "orthogonal"
-    train_h0 : learn the initial state instead of fixing it at 0
+    tau : unit time constant in milliseconds. A scalar gives every unit the
+        same value; a ``(low, high)`` pair draws per-unit values log-uniformly
+        from that range.
+    dt : integration step in milliseconds; should match the task's ``dt``.
+    noise : SD of the private recurrent noise, scaled by ``sqrt(2 / alpha)``
+        so that the stationary variance of the noise-driven state is
+        independent of ``dt``. Applied in training mode only.
+    g : gain of the recurrent weight initialisation.
+    rec_init : ``"gaussian"`` (i.i.d. N(0, g^2 / N)) or ``"orthogonal"``
+        (orthogonal matrix scaled by ``g``).
+    train_h0 : learn the initial state instead of fixing it at zero.
+    train_tau : learn the (log) time constants.
     """
 
     def __init__(self, input_size, hidden_size, output_size, *,
@@ -98,31 +92,13 @@ class VanillaRNN(_BaseRNN):
                  train_h0: bool = False, train_tau: bool = False,
                  nonlinearity=torch.tanh):
         super().__init__(input_size, hidden_size, output_size)
-        # tau may be a single number (every unit identical, the original
-        # behaviour) or a (low, high) pair, in which case the units get time
-        # constants log-uniform over that range. MILLISECONDS, like dt.
-        #
-        # tau is the RATE-UNIT time constant, not a membrane time constant. A
-        # cortical membrane tau is 10-20 ms; 100 ms is the usual value for a
-        # rate unit and is taken to stand for NMDA-dominated synaptic decay.
-        # Do not reach past that range to buy slow dynamics: measured intrinsic
-        # timescales in cortex top out around 350 ms (Murray et al. 2014) and
-        # those are NETWORK autocorrelations, not single-unit leaks.
-        #
-        # Slow behaviour is meant to come from the recurrent connectivity. With
-        # tau = 100 ms (alpha = 0.2), a mode lasting 1 s needs an eigenvalue of
-        # W_rec at +0.90 ON THE POSITIVE REAL AXIS -- |lambda_W| = 0.9 at 0 deg
-        # gives tau_mode = 0.99 s, but the same modulus at 60 deg gives 0.20 s.
-        # A g/sqrt(N) Gaussian scatters eigenvalues uniformly over the disc, so
-        # it puts only ~3 of 128 modes past 1 s. That is a statement about the
-        # INITIALISATION, not about what the architecture can represent.
         if isinstance(tau, (tuple, list)):
             lo, hi = float(tau[0]), float(tau[1])
             t = torch.exp(torch.empty(hidden_size).uniform_(
                 math.log(lo), math.log(hi)))
         else:
             t = torch.full((hidden_size,), float(tau))
-        # tau must exceed dt or alpha > 1 and a unit overshoots in one step.
+        # tau must exceed dt, otherwise alpha > 1 and the update overshoots.
         log_tau = torch.log(t.clamp_min(float(dt) * 1.0001))
         if train_tau:
             self.log_tau = nn.Parameter(log_tau)
@@ -144,8 +120,8 @@ class VanillaRNN(_BaseRNN):
 
     @property
     def alpha(self) -> Tensor:
-        """Per-unit leak, dt / tau, as a (hidden,) tensor. Clamped below 1 so a
-        unit can never overshoot within one step."""
+        """Per-unit leak ``dt / tau`` as a ``(hidden,)`` tensor, clamped to
+        at most 1."""
         return (self.dt / torch.exp(self.log_tau)).clamp(1e-4, 1.0)
 
     @property
@@ -160,18 +136,16 @@ class VanillaRNN(_BaseRNN):
         a = self.alpha
         pre = self.rec(h) + self.inp(x)
         if self.training and self.noise > 0:
-            # sqrt(2/alpha) keeps the stationary variance of the noise-driven
-            # state independent of dt -- per unit, since alpha now is.
             pre = pre + torch.sqrt(2.0 / a) * self.noise * torch.randn_like(pre)
         return (1 - a) * h + a * self.phi(pre)
 
     def velocity(self, x: Tensor, h: Tensor) -> Tensor:
-        """dh/dt in units of the update: F(h, x) - h. Zero at fixed points."""
+        """One-step state change ``F(h, x) - h``; zero at a fixed point."""
         return self.step(x, h) - h
 
 
 class GRUModel(_BaseRNN):
-    """Gated recurrent unit, same interface (drop-in comparison model)."""
+    """Gated recurrent unit with the same interface."""
 
     def __init__(self, input_size, hidden_size, output_size, **kw):
         super().__init__(input_size, hidden_size, output_size)
@@ -185,8 +159,8 @@ class GRUModel(_BaseRNN):
 
 
 class LSTMModel(_BaseRNN):
-    """LSTM; state is (h, c) concatenated into one vector so the geometry
-    tools (which expect a single state vector) still apply."""
+    """LSTM with the same interface. The state ``(h, c)`` is concatenated
+    into a single vector of length ``2 * hidden_size``."""
 
     state_is_tuple = True
 
@@ -216,7 +190,7 @@ MODELS = {"vanilla": VanillaRNN, "gru": GRUModel, "lstm": LSTMModel}
 
 
 def make_model(name: str, spec, hidden_size: int = 128, **kw):
-    """Build a model directly from a ``TaskSpec``.
+    """Build a model from a ``TaskSpec``.
 
     >>> model = make_model("vanilla", task.spec, hidden_size=128, dt=task.dt)
     """

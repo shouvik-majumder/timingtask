@@ -1,13 +1,13 @@
 """
-timingtask.training — a task-agnostic supervised trainer.
-=============================================================
+timingtask.training: a task-agnostic supervised trainer.
 
-Knows nothing about any specific task or model beyond the two interfaces:
+Depends only on the two interfaces
 
     batch = task.sample(B)        -> TrialBatch (inputs, targets, loss_mask)
     out, H = model(batch.inputs)  -> (B, T, out), (B, T, hidden)
 
-so a new task or a new architecture drops straight in.
+so any :class:`~timingtask.contract.Task` and any model from
+:mod:`timingtask.models` can be combined.
 
     hist = train(model, task, steps=2000)
     print(hist["acc"][-1])
@@ -28,7 +28,7 @@ __all__ = ["masked_loss", "train", "evaluate", "run_trials"]
 
 def masked_loss(outputs: Tensor, batch: TrialBatch, kind: str = "cross_entropy"
                 ) -> Tensor:
-    """Loss averaged over the (B, T) positions where ``loss_mask`` is True."""
+    """Loss averaged over the ``(B, T)`` positions where ``loss_mask`` is True."""
     m = batch.loss_mask
     if kind == "cross_entropy":
         B, T, K = outputs.shape
@@ -48,12 +48,11 @@ def train(model: nn.Module, task: Task, *, steps: int = 2000,
           log_every: int = 200, device: str = "cpu",
           on_log: Optional[Callable[[int, Dict], None]] = None,
           verbose: bool = True) -> Dict[str, List[float]]:
-    """Train ``model`` on ``task``. Returns a history dict.
+    """Train ``model`` on ``task`` with Adam. Returns a history dict with
+    ``step``, ``loss`` and ``acc`` entries at each log point.
 
-    l2_rate : penalty on mean squared firing rate (keeps dynamics tame and
-        makes fixed-point structure cleaner — standard in the RNN-for-neuro
-        literature).
-    l2_weight : penalty on recurrent weight magnitude.
+    l2_rate : coefficient of a penalty on the mean squared hidden activity.
+    l2_weight : coefficient of a penalty on the squared recurrent weights.
     """
     model.to(device).train()
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -96,18 +95,11 @@ def train(model: nn.Module, task: Task, *, steps: int = 2000,
 @torch.no_grad()
 def evaluate(model: nn.Module, task: Task, *, batch_size: int = 256,
              device: str = "cpu") -> Tensor:
-    """Mean accuracy on a fresh batch (model set to eval → no noise).
+    """Mean accuracy on a fresh batch, with the model in eval mode.
 
-    A task that defines its own ``accuracy`` gets to decide what "correct"
-    means, and this defers to it. Only tasks that do NOT override it fall back
-    to the categorical rule below.
-
-    That fallback assumes ``targets`` is ``(B, T)`` integer class labels, which
-    is true of every cross-entropy task but not of a regression task, whose
-    targets are ``(B, T, out)`` — the shapes then fail to broadcast. It also
-    scores by ``argmax``, which is meaningless for a scalar readout. The timing
-    task, for instance, is "correct" when its readout crosses threshold inside
-    the answer window; no amount of argmax expresses that.
+    If the task overrides :meth:`Task.accuracy`, that definition is used.
+    Otherwise accuracy is the argmax match over masked positions with a
+    nonzero target, which assumes ``(B, T)`` integer targets.
     """
     was_training = model.training
     model.eval()
@@ -118,7 +110,6 @@ def evaluate(model: nn.Module, task: Task, *, batch_size: int = 256,
         acc = task.accuracy(out, batch)
         acc = acc.mean() if getattr(acc, "ndim", 0) else acc
     else:
-        # score only the decision epoch: positions where the target is nonzero
         dec = batch.loss_mask & (batch.targets > 0)
         pred = out.argmax(-1)
         acc = ((pred == batch.targets) & dec).sum().double() / dec.sum().clamp_min(1)
@@ -131,7 +122,8 @@ def evaluate(model: nn.Module, task: Task, *, batch_size: int = 256,
 @torch.no_grad()
 def run_trials(model: nn.Module, task: Task, batch_size: int = 256,
                device: str = "cpu"):
-    """Sample a batch and run it (noise-free). Returns (batch, outputs, hidden)."""
+    """Sample a batch and run the model on it in eval mode. Returns
+    ``(batch, outputs, hidden)``."""
     was_training = model.training
     model.eval()
     batch = task.sample(batch_size).to(device)

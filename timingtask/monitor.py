@@ -1,14 +1,9 @@
 """
-timingtask.monitor — one record stream, many consumers.
-====================================================================
+timingtask.monitor: per-trial record logging.
 
-The generator emits a flat record per trial. Monitors subscribe. Nothing plots
-inline, and a monitor can never affect training: one that raises is caught,
-reported once, and disabled for the rest of the run.
-
-``JSONLMonitor`` is the durable one and should always be attached. Every figure
-must be reproducible from its file alone, so a plot can be regenerated without
-re-running training.
+The generator emits one flat record per completed trial. Monitors subscribe to
+that stream. A monitor cannot affect training: one that raises is reported
+once and removed for the rest of the run.
 
     mons = MonitorList([JSONLMonitor("runs/fixed_01.jsonl")])
     env = TimingTaskEnv(monitors=mons)
@@ -43,7 +38,7 @@ def _jsonable(o):
 
 
 class Monitor:
-    """Subscriber interface. Override what you need; all hooks are optional."""
+    """Subscriber interface. All hooks are optional."""
 
     def on_reset(self, info: Dict[str, Any]) -> None: ...
     def on_trial(self, record: Dict[str, Any]) -> None: ...
@@ -51,7 +46,7 @@ class Monitor:
 
 
 class MemoryMonitor(Monitor):
-    """Keeps records in a list. For tests and short runs."""
+    """Keeps records in a list."""
 
     def __init__(self):
         self.records: List[Dict[str, Any]] = []
@@ -65,7 +60,7 @@ class MemoryMonitor(Monitor):
 
 
 class JSONLMonitor(Monitor):
-    """Append-only newline-delimited JSON. The durable record of a run."""
+    """Appends records to a newline-delimited JSON file."""
 
     def __init__(self, path: str, flush_every: int = 20):
         self.path = str(path)
@@ -95,10 +90,9 @@ class JSONLMonitor(Monitor):
 
 
 class MonitorList(Monitor):
-    """Fan out to several monitors, isolating failures.
+    """Fans records out to several monitors, isolating failures.
 
-    A monitor that raises is reported once and dropped. Monitoring must never
-    take a training run down with it.
+    A monitor that raises is reported once and removed from the list.
     """
 
     def __init__(self, monitors: Optional[Iterable[Monitor]] = None):
@@ -129,10 +123,10 @@ class MonitorList(Monitor):
 
 
 # --------------------------------------------------------------------------- #
-# replay
+# reading records back
 # --------------------------------------------------------------------------- #
 def read_jsonl(path: str, event: str = "trial") -> List[Dict[str, Any]]:
-    """Read back a run. ``event=None`` returns every line."""
+    """Read a JSONL run file. ``event=None`` returns every line."""
     out = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -146,11 +140,10 @@ def read_jsonl(path: str, event: str = "trial") -> List[Dict[str, Any]]:
 
 
 def records_to_arrays(records: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
-    """Columnar view of a record list, for plotting.
+    """Columnar view of a record list.
 
-    Scalar fields become arrays; ``lick_times_s`` stays a list of lists because
-    trials have different numbers of licks. Missing values become NaN so a
-    partially-populated field still plots.
+    Scalar fields become arrays; ``lick_times_s`` remains a list of lists
+    because trials differ in their number of licks. Missing values become NaN.
     """
     if not records:
         return {}

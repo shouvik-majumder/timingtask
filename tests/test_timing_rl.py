@@ -35,7 +35,8 @@ ONTIME = lambda g: (g.timer is not None and g.decisive_lick_s is None
 
 # --------------------------------------------- across-trial subjective value
 def test_value_gain_rises_after_failure_and_falls_after_success():
-    """One scalar scales BOTH the water and the early-lick penalty."""
+    """The gain exceeds 1 after a run of failures and falls below 1 after a
+    run of successes; ``reward_rate_gain=0`` disables it."""
     def rate_after(policy, gain=1.0, n=150):
         g = gen(reward_rate_gain=gain, no_cue_prob=0.0,
                 iti_restart_on_lick=False)
@@ -74,9 +75,7 @@ def test_value_gain_scales_the_water_and_the_early_penalty_together():
 
 
 def test_previous_outcome_channel_is_signed():
-    """+1 rewarded, -1 responded and wrong, 0 no decision. Zero is reserved for
-    'no evidence' because a channel that is exactly 0.0 contributes a gradient
-    of exactly zero to its input weights and freezes that column of W_in."""
+    """+1 rewarded, -1 responded and unrewarded, 0 no response."""
     g = gen(no_cue_prob=0.0, iti_restart_on_lick=False)
     seen = set()
     for _ in range(4000):
@@ -94,18 +93,15 @@ def test_value_gain_is_clipped():
 
 
 def test_value_gain_hidden_from_the_agent():
-    """The animal feels water become more valuable but is never told the
-    number -- it has to infer it from its own outcome history."""
+    """The value gain and the reward rate are not observation channels."""
     labels = gen(reward_rate_gain=1.0).observation_labels()
     assert "value_gain" not in labels and "reward_rate" not in labels
 
 
 # -------------------------------------------------------------- history
 def test_history_channels_vary_once_the_agent_acts():
-    """REGRESSION. Under open-loop supervised training these channels had
-    EXACTLY zero variance -- the observer never licked, so there was never a
-    success or a first-lick time. A network was being asked to infer a block
-    from constants."""
+    """The success and first-lick channels take nonzero values once the agent
+    responds."""
     g = gen(no_cue_prob=0.0)
     obs = []
     for _ in range(6):
@@ -139,8 +135,7 @@ def test_history_shifts_by_one_trial():
 
 
 def test_history_is_constant_within_a_trial():
-    """A static offset, not an event -- so the agent can set a ramp slope from
-    the first step of the trial."""
+    """The previous-trial channels are held constant for the whole trial."""
     g = gen(no_cue_prob=0.0)
     run_trials(g, ONTIME, 1)
     j = g.observation_labels().index("first_lick_t-1")
@@ -170,8 +165,7 @@ def test_actor_critic_shapes():
 
 
 def test_core_step_stays_a_pure_function():
-    """The geometry tools need this: torch.func must be able to differentiate
-    the dynamics, so the core's step must not be stateful."""
+    """``torch.func`` can take the Jacobian of the core's ``step``."""
     from torch.func import jacrev
     tr, m = build()
     x = torch.zeros(1, tr.obs_size)
@@ -228,7 +222,7 @@ def test_training_runs_and_reports_engagement_separately():
 
 
 def test_summarise_splits_engagement_from_correctness():
-    """An agent that never licks scores no errors; accuracy alone cannot see it."""
+    """A policy that never licks has p_engaged 0 and p_miss 1."""
     never = [{"no_cue_trial": False, "decisive_lick_s": None, "rewarded": False,
               "early": False, "miss": True, "delay": 0.3, "first_lick_s": None}] * 5
     s = summarise(never)
@@ -247,8 +241,8 @@ def test_summarise_ignores_catch_trials():
     assert s["n"] == 0
 
 
-def test_envs_are_independent_animals():
-    """Each generator keeps its own outcome history, delay schedule and trials."""
+def test_envs_are_independent():
+    """Each generator keeps its own scheduler, history and trial state."""
     tr, m = build(n_envs=6)
     assert len({id(g) for g in tr.gens}) == 6
     assert len({id(g.scheduler) for g in tr.gens}) == 6
@@ -262,16 +256,9 @@ def test_envs_are_independent_animals():
 
 
 def test_an_untrained_policy_never_escapes_the_iti():
-    """The actual starting condition for RL, and the first thing that has to be
-    learned. A near-uniform policy licks on ~half of all steps; every lick
-    restarts the stop-licking period, so the cue never fires and every trial
-    ends in iti_timeout at the cap.
-
-    Two consequences worth remembering when tuning: the agent's first learning
-    problem is withholding, not timing; and each of these wasted trials costs a
-    full `iti_timeout` worth of BPTT, so a short timeout early in training is
-    much cheaper than a realistic one.
-    """
+    """With the restart rule on, a near-uniform policy licks on about half of
+    all steps, so the stop-licking period never completes and every trial
+    ends in ``iti_timeout``."""
     tr, m = build(n_envs=4, iti_timeout=1.0)
     out = rollout(m, tr.gens)
     recs = [r for r in out["records"] if r is not None]
@@ -312,7 +299,7 @@ def test_iti_readout_penalty_lowers_the_shaped_reward_only_in_the_iti():
     assert float(d[out["iti"] == 1].sum()) > 0.0
 
 
-# ------------------------------------------------- round-2 knobs
+# ------------------------------------------------- exploration and regularisers
 def test_min_action_prob_floors_the_entropy():
     import math
     tr, m = build(n_envs=4)
@@ -342,8 +329,8 @@ def test_activity_penalties_are_positive_and_iti_restricted():
 
 
 def test_activity_scope_full_covers_more_steps_than_iti():
-    # restart off, or an untrained policy never leaves the ITI and the two
-    # scopes cover the same steps -- which is the round-1 trap, not a scope bug
+    # With the restart rule off an untrained policy leaves the ITI, so the two
+    # scopes cover different numbers of steps.
     tr, m = build(n_envs=4, iti_restart_on_lick=False)
     out = rollout(m, tr.gens, max_steps=2000)
     full = float(out["mask"].sum())
@@ -398,7 +385,7 @@ def test_run_report_writes_every_figure(tmp_path):
                       out_dir=str(tmp_path), clip=1.0)
     assert {"training", "heads", "behaviour_training", "history_training",
             "behaviour_probe", "history_probe"} <= set(figs)
-    assert "behaviour_final" not in figs        # replaced by the test conditions
+    assert "behaviour_final" not in figs
     assert len(list(tmp_path.glob("t_*.png"))) >= 6
 
 
@@ -499,9 +486,10 @@ def test_heads_dashboard_renders(tmp_path):
     fig.savefig(tmp_path / "heads.png", dpi=60)
 
 
-# ------------------------------------------------- round-5 reward structure
+# ------------------------------------------------- reward structure
 def test_time_penalty_is_not_charged_during_the_post_lick_winddown():
-    """It used to be, which paid the agent 1.5 s of step cost to NOT lick."""
+    """The per-step cost applies in the post-lick period only when
+    ``time_penalty_in_post`` is set."""
     from timingtask.generator import Phase
     for in_post, expect in ((False, 0.0), (True, -0.05)):
         tc = TimingTaskConfig(dt=0.02, time_penalty=-0.05,
@@ -518,7 +506,7 @@ def test_every_wrong_lick_costs_the_same_in_base():
     from timingtask.variants import BASE
     t = BASE["task"]
     assert t["iti_lick_penalty"] == t["early_penalty"] == t["no_cue_lick_penalty"]
-    assert t["discount_rate"] == 0.0          # temporal discounting removed
+    assert t["discount_rate"] == 0.0
 
 
 def test_training_stops_early_on_target_delay_and_on_stall():
@@ -535,15 +523,15 @@ def test_describe_is_generated_from_the_live_config():
     from timingtask.variants import describe, BASE
     md = describe("act")
     assert f"`{BASE['task']['reward']!r}`" in md     # reads the live value
-    assert "AD HOC RULE" in md and "THRESHOLD" in md and "LOSS TERM" in md
+    for heading in ("## Task and reinforcement", "## Delay schedule",
+                    "## Network", "## Variants"):
+        assert heading in md
     assert md.count("|") > 100
 
 
-# ------------------------------------------------- the post-lick wind-down
+# ------------------------------------------------- the post-lick period
 def test_post_lick_winddown_earns_and_costs_nothing():
-    """After the decisive lick the trial keeps running so the recorded data has
-    a peri-lick epoch, but nothing there may touch the reward: no lick penalty
-    (there never was one) and no step cost (there used to be)."""
+    """No reward or penalty is paid during the post-lick period."""
     tr, m = build(n_envs=4, iti_restart_on_lick=False)
     out = rollout(m, tr.gens, max_steps=2000)
     post = out["mask"] * out["post"]
@@ -584,8 +572,8 @@ def test_tau_is_learnable_only_when_asked():
 
 
 def test_a_tau_spread_gives_the_network_slow_modes_to_build_a_timer_from():
-    """The point of the change: with one tau nearly every mode of the initial
-    network decays in ~100 ms, so a 1 s interval has no substrate."""
+    """A log-uniform spread of time constants gives the initial network more
+    modes with decay times above one second than a single tau."""
     import numpy as np
     from timingtask.models import VanillaRNN
     def slow_modes(tau, seed=0):
@@ -600,8 +588,9 @@ def test_a_tau_spread_gives_the_network_slow_modes_to_build_a_timer_from():
 
 # ------------------------------------------ recurrent initialisation and clip
 def test_orthogonal_init_gives_more_slow_modes_without_leaving_the_unit_disc():
-    """Orthogonal at g=1 dominates a raised gaussian g: all |lambda_W| = 1, so
-    the slow modes are the ones near angle 0 and nothing exits the disc."""
+    """An orthogonal initialisation at g=1 has more slow modes than the
+    Gaussian default while keeping every eigenvalue inside the unit disc;
+    raising g instead moves eigenvalues outside it."""
     import numpy as np
     from timingtask.models import VanillaRNN
     def spec(seed, **kw):

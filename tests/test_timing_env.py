@@ -37,16 +37,15 @@ def test_episode_is_a_session_of_trials():
 
 
 def test_episode_end_is_truncated_not_terminated():
-    """No terminal state -- an agent must not bootstrap a zero value here."""
+    """Episode end is reported as truncated, never terminated."""
     env = TimingTaskEnv(variant="fixed", trials_per_episode=2)
     env.reset(seed=0)
     _, info = wait(env)
     assert info["trials_done"] == 2
 
 
-def test_reset_is_a_new_animal():
-    """The old bug: reset(seed=) rebuilt the scheduler and silently wiped
-    autolearn progress while other state survived. Now nothing survives."""
+def test_reset_rebuilds_all_state():
+    """``reset`` rebuilds the generator and scheduler; no state survives."""
     sc = SchedulerConfig(mode="autolearn", perf_window=5, min_trials_per_delay=5,
                          initial_delay=0.1, delay_step=0.1)
     env = TimingTaskEnv(TimingTaskConfig(seed=0), sc, trials_per_episode=100000)
@@ -82,7 +81,7 @@ def test_discrete_action_validation():
 
 
 def test_continuous_action_is_threshold_crossing():
-    """Ramp-to-bound: the readout is a scalar, a lick is a threshold crossing."""
+    """In continuous mode a lick is registered when the signal exceeds the threshold."""
     env = TimingTaskEnv(variant="fixed", trials_per_episode=2,
                         action_mode="continuous", lick_threshold=0.5)
     env.reset(seed=0)
@@ -178,8 +177,8 @@ def test_records_to_arrays_empty():
 
 # ------------------------------------------------------- behaviour sanity
 def test_a_perfect_timer_gets_rewarded_and_promotes_the_delay():
-    """An agent that licks exactly when eligible should hit 100% and drive the
-    autolearn staircase upward."""
+    """An agent that licks as soon as it is eligible is always rewarded and
+    advances the autolearn schedule."""
     sc = SchedulerConfig(mode="autolearn", initial_delay=0.1, delay_step=0.1,
                          perf_window=10, min_trials_per_delay=10, max_delay=0.5)
     mon = MemoryMonitor()

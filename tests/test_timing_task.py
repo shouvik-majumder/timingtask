@@ -26,9 +26,8 @@ def run(gen, policy, max_steps=200000):
 
 # --------------------------------------------------------------------- cue
 def test_cue_is_a_signal_not_a_phase():
-    """Cue duration and reward eligibility are independent axes: with a delay
-    SHORTER than the cue, a lick after the delay but while the cue is still on
-    must be REWARDED. This is the whole point of the restructure."""
+    """With a delay shorter than the cue, a lick after the delay but while
+    the cue is still on is rewarded."""
     g = build(cue_duration=0.6, mode="fixed", fixed_delay=0.2, no_cue_prob=0.0)
     while g.phase != Phase.ELIGIBLE:
         g.step(False)
@@ -55,7 +54,7 @@ def test_cue_on_depends_only_on_time_since_onset():
     assert min(on) == 0.0, "agent must see timer == 0 at cue onset"
     assert max(on) < 0.2
     assert len(on) == g.cfg.steps(0.2), "cue visible for exactly cue_steps steps"
-    # cue goes off while still WAITING -- a phase model could not express this
+    # the cue turns off while the trial is still in WAITING
     assert any(ph == Phase.WAITING and not c for _, c, ph in seen)
 
 
@@ -105,7 +104,7 @@ def test_iti_lick_restarts_the_stop_licking_period():
 
 
 def test_iti_timeout_terminates():
-    """An agent that licks forever never reaches the cue and must be released."""
+    """A trial that never leaves the stop-licking period ends at ``iti_timeout``."""
     g = build(mode="fixed", iti_timeout=1.0, no_cue_prob=0.0)
     recs = run_until(g, lambda _: True, 1)
     assert recs[0]["outcome"] == "iti_timeout"
@@ -125,7 +124,7 @@ def run_until(gen, policy, n):
 
 # -------------------------------------------------------------- post-lick
 def test_trial_continues_after_the_rewarded_lick():
-    """peri_lick and post_lick epochs must exist in generated data."""
+    """The trial continues for ``post_lick`` seconds after the rewarded lick."""
     g = build(mode="fixed", fixed_delay=0.2, post_lick=1.0, no_cue_prob=0.0)
     while g.phase != Phase.ELIGIBLE:
         g.step(False)
@@ -171,7 +170,7 @@ def test_fixed_delay_never_moves():
 
 
 def test_autolearn_promotes_on_the_published_criterion():
-    """30% rewarded over 100 trials at a delay -> +0.1 s."""
+    """More than 30% rewarded over 100 trials at a delay raises it by 0.1 s."""
     sc = SchedulerConfig(mode="autolearn", initial_delay=0.1, delay_step=0.1,
                          perf_window=100, min_trials_per_delay=100,
                          success_threshold=0.30)
@@ -224,8 +223,7 @@ def test_cue_autolearn_blocked_by_iti_licking():
 
 
 def test_iti_criterion_is_a_rate_and_is_off_by_default():
-    """The fraction-of-trials measure it replaced saturated at 1.0 and could
-    not see a tenfold fall in ITI licking."""
+    """The ITI criterion is a lick rate in Hz and is disabled by default."""
     sc = SchedulerConfig(mode="cue_autolearn", cue_association_window=10,
                          cue_association_min_trials=10,
                          cue_association_success_threshold=0.5)
@@ -288,7 +286,7 @@ def test_variants_differ_only_in_durations():
 
 # ------------------------------------------------------- ITI restart rule
 def _free_licker(restart, n=120, p_lick=0.05, seed=0):
-    """A constant-hazard licker: the failure mode the flag exists to escape."""
+    """Run a constant-hazard licker with the restart rule on or off."""
     rng = np.random.default_rng(seed)
     t = TimingTaskConfig(dt=0.02, answer_window=0.8, post_lick=0.5,
                          iti_mean=3.0, iti_min=2.0, iti_max=5.0,
@@ -307,8 +305,6 @@ def _free_licker(restart, n=120, p_lick=0.05, seed=0):
 def test_iti_restart_flag_controls_whether_the_cue_is_reachable():
     on, off = _free_licker(True), _free_licker(False)
     reach = lambda rs: sum(r.get("cue_onset_step") is not None for r in rs) / len(rs)
-    # With the restart rule a free licker almost never reaches a cue, which is
-    # exactly why it cannot learn the association. Without it, most trials do.
     assert reach(on) < 0.2
     assert reach(off) > 0.6
 
@@ -339,9 +335,8 @@ def _cue_columns(mode, delay=1.0, n=400):
 
 
 def test_cue_step_persists_past_cue_offset_and_the_pulse_does_not():
-    """With tau = 100 ms a 0.6 s pulse leaves nothing in the state by the time
-    a 1 s delay elapses; a step gives a near-integrator something to
-    accumulate."""
+    """The pulse channel is on for ``cue_duration``; the step channel stays on
+    until the trial ends."""
     pulse, _ = _cue_columns("pulse")
     step, _ = _cue_columns("step")
     assert int(pulse.sum()) == 30                 # cue_duration / dt
@@ -349,8 +344,7 @@ def test_cue_step_persists_past_cue_offset_and_the_pulse_does_not():
 
 
 def test_both_gives_two_cue_channels_the_transient_and_the_tonic():
-    """Yang et al.'s arrangement: a transient cue off the integration manifold
-    plus a tonic step that drives the integrator."""
+    """``cue_mode="both"`` exposes the transient and the tonic channel."""
     cols, g = _cue_columns("both")
     assert g.observation_labels()[:2] == ["cue", "cue_step"]
     assert g.obs_size == 6
@@ -361,7 +355,7 @@ def test_both_gives_two_cue_channels_the_transient_and_the_tonic():
 
 
 def test_catch_trials_stay_at_zero_on_every_cue_channel():
-    """The zero-input control has to survive the change."""
+    """Catch trials hold every cue channel at zero in every cue mode."""
     for mode in ("pulse", "step", "both"):
         rng = np.random.default_rng(1)
         t = TimingTaskConfig(dt=0.02, cue_mode=mode, no_cue_prob=1.0,

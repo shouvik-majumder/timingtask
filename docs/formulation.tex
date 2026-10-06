@@ -1,0 +1,345 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\1}{\mathbf{1}}
+\DeclareMathOperator{\Cat}{Cat}
+
+\title{\bf The Cue-Triggered Lick-Timing Task:\\ Environment, Agent and Learning Rule}
+\author{\texttt{timingtask}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent
+This document specifies the reinforcement-learning formulation implemented in
+\texttt{timingtask}: the observation, the recurrent agent, the reward, and the
+computation performed by one training update. The reference implementation is
+\texttt{generator.py} (environment), \texttt{models.py} (network) and \texttt{rl.py}
+(agent and trainer). Default values refer to \texttt{variants.BASE}.
+
+\tableofcontents
+
+\section{Notation}\label{sec:notation}
+
+\begin{definition}[Indices and dimensions]
+\begin{itemize}
+  \item $b \in \{1,\dots,B\}$ indexes the environment copy. $B$ independent trial
+        generators run in lockstep and share one set of network weights; each keeps its
+        own trial history, outcome history and delay schedule. Equations are written for a
+        single $b$ except where the batch is summed over.
+  \item $t \in \{0,\dots,T-1\}$ indexes the time step within one episode. One episode is
+        one trial. The step size is $\mathrm{d}t$ seconds; $T$ is the length of the longest
+        trial in the batch and shorter trials are padded (\S\ref{sec:mask}).
+  \item $i$ indexes the gradient update. One update consumes one batch of $B$ episodes.
+  \item $N$ is the number of recurrent units, $d_u$ the observation dimension and
+        $|\mathcal{A}| = 2$ the number of actions (wait, lick).
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Stop-gradient]
+$\sg[\cdot]$ is the identity in the forward pass and the zero map in the backward pass
+(\texttt{.detach()} in PyTorch).
+\end{definition}
+
+\section{Observation}\label{sec:obs}
+
+\begin{definition}[Observation vector]
+At step $t$ the agent receives $u_t \in \R^{d_u}$ consisting of one or two cue channels
+followed by $4K$ previous-trial channels, where $K$ is \texttt{n\_lags}:
+\begin{align}
+  c_t        &= \1\bigl[\,0 \le t - t_{\mathrm{cue}} < n_{\mathrm{cue}}\,\bigr]
+    && \text{transient cue (\texttt{cue\_mode} pulse or both)}, \\
+  s_t        &= \1\bigl[\, t \ge t_{\mathrm{cue}}\,\bigr]
+    && \text{tonic cue (\texttt{cue\_mode} step or both)}, \\
+  \rho_{-k}  &= \textstyle\sum_{t} r_t^{(-k)}
+    && \text{total reward on the $k$-th previous trial}, \\
+  \alpha_{-k}    &= \1[\text{the $k$-th previous trial contained a decisive lick}], \\
+  \varsigma_{-k} &\in \{+1, 0, -1\}
+    && \text{rewarded / no response / responded and unrewarded}, \\
+  \phi_{-k}      &= \text{first-lick latency on the $k$-th previous trial (s; 0 if none)},
+\end{align}
+for $k = 1,\dots,K$. $t_{\mathrm{cue}}$ is the step of cue onset (undefined before it, in
+which case $c_t = s_t = 0$) and $n_{\mathrm{cue}} = \lceil \texttt{cue\_duration}/\mathrm{d}t
+\rceil$. On catch trials every cue channel is zero for the whole trial.
+\end{definition}
+
+\begin{remark}[The cue is independent of the trial phase]
+$c_t$ depends only on the time since cue onset. If the required delay is shorter than the
+cue duration, the cue is still on during the rewarded window.
+\end{remark}
+
+\begin{remark}[The previous-trial channels are constant within a trial]
+$\rho_{-k},\alpha_{-k},\varsigma_{-k},\phi_{-k}$ are written when a trial ends and held
+fixed for every step of the next trial. Cross-trial information therefore reaches the
+network through its input, which allows one episode to be one trial.
+\end{remark}
+
+\section{Network}\label{sec:net}
+
+The recurrent core is a leaky $\tanh$ network with hidden state $h_t \in \R^{N}$.
+
+\begin{definition}[State equation]
+\begin{align}
+  a_t &= W_{\mathrm{rec}}\, h_{t-1} + W_{\mathrm{in}}\, u_t + b_{\mathrm{in}}
+    + \sqrt{\tfrac{2}{\alpha}}\,\sigma_{\!\xi}\,\xi_t,
+    \qquad \xi_t \sim \mathcal{N}(0, I_N), \label{eq:pre}\\[2pt]
+  h_t &= (1-\alpha)\, h_{t-1} + \alpha\, \tanh(a_t),
+    \qquad h_{-1} = h_0. \label{eq:state}
+\end{align}
+\end{definition}
+
+\noindent
+$\alpha = \mathrm{d}t/\tau$ is the leak, with $\tau$ the unit time constant (a scalar, or
+a per-unit vector drawn log-uniformly from a range). $W_{\mathrm{rec}} \in \R^{N\times N}$
+is initialised either i.i.d.\ $\mathcal{N}(0, g^2/N)$ or as an orthogonal matrix scaled
+by $g$; $(W_{\mathrm{in}})_{jk}\sim\mathcal{N}(0,1/d_u)$ and $b_{\mathrm{in}} = 0$ at
+initialisation. The factor $\sqrt{2/\alpha}$ makes the stationary variance of the
+noise-driven state independent of $\mathrm{d}t$. Noise is applied in training mode only.
+$h_0 = 0$ and is not trained by default.
+
+\begin{definition}[Heads]
+\begin{align}
+  z_t &= W_{\pi}\, h_t + b_{\pi} \in \R^{2} && \text{policy logits}, \label{eq:logits}\\
+  V_t &= w_v^{\top} h_t + b_v \in \R && \text{value estimate}. \label{eq:value}
+\end{align}
+At initialisation $W_\pi$ is scaled by $0.1$ and $b_\pi = 0$.
+\end{definition}
+
+The trained parameters are
+$\theta = \{ W_{\mathrm{in}}, b_{\mathrm{in}}, W_{\mathrm{rec}}, W_{\pi}, b_{\pi}, w_v, b_v \}$,
+plus $\log\tau$ if \texttt{train\_tau} is set.
+
+\section{Policy}\label{sec:policy}
+
+\begin{definition}[Action distribution]
+With $z_t = (z_t^{\mathrm{wait}}, z_t^{\mathrm{lick}})^{\!\top}$,
+\begin{equation}
+  \pi_t = \softmax(z_t), \qquad A_t \sim \Cat(\pi_t), \qquad A_t = 1 \equiv \text{lick}.
+\end{equation}
+With a probability floor $\epsilon = \texttt{min\_action\_prob} > 0$ the sampled
+distribution is $\tilde\pi_t = \epsilon + (1 - 2\epsilon)\,\pi_t$; the same $\tilde\pi_t$
+is used for the log-likelihood below.
+\end{definition}
+
+\begin{definition}[Logit gap and lick probability]
+\begin{equation}
+  \Delta_t = z_t^{\mathrm{lick}} - z_t^{\mathrm{wait}}
+    = w_\Delta^{\top} h_t + (b_{\pi}^{\mathrm{lick}} - b_{\pi}^{\mathrm{wait}}),
+  \qquad w_\Delta = W_{\pi,\mathrm{lick}} - W_{\pi,\mathrm{wait}},
+\end{equation}
+\begin{equation}
+  p_t = \pi_t(\mathrm{lick}) = \sigma(\Delta_t), \qquad \sigma(x) = (1+e^{-x})^{-1}.
+\end{equation}
+$p_t$ is a discrete-time hazard rate; the first lick ends the decision, so the lick time
+is the first passage of this hazard. $\Delta_t$ is the \emph{policy readout} exported by
+\texttt{attach\_states}.
+\end{definition}
+
+\begin{definition}[Entropy and log-likelihood]
+\begin{equation}
+  \mathcal{H}_t = -\!\sum_{a}\! \pi_t(a)\log \pi_t(a), \qquad
+  \ell_t = \log \tilde\pi_t(A_t).
+\end{equation}
+The entropy is logged as a diagnostic and does not enter the loss.
+\end{definition}
+
+\section{Environment}\label{sec:env}
+
+Let $\mathcal{P}_t \in \{\textsc{iti}, \textsc{waiting}, \textsc{eligible}, \textsc{post},
+\textsc{no\_cue}\}$ be the phase before step $t$ is taken.
+
+\begin{definition}[Accepted lick]
+\begin{equation}
+  L_t = A_t \cdot \1\!\left[\, t - t_{\mathrm{last}} \ge n_{\mathrm{ref}} \,\right],
+  \qquad n_{\mathrm{ref}} = \max\!\bigl(1, \lceil \texttt{lick\_refractory}/\mathrm{d}t \rceil\bigr),
+\end{equation}
+where $t_{\mathrm{last}}$ is the step of the last accepted lick. Only $L_t$ has
+consequences in the environment.
+\end{definition}
+
+\begin{definition}[Reward]
+\begin{equation}
+  r_t = k_{\mathrm{time}}\,\1[\mathcal{P}_t \ne \textsc{post} \;\vee\; \texttt{time\_penalty\_in\_post}]
+  \;+\;
+  \begin{cases}
+    k_{\mathrm{iti}}\, L_t + k_{\mathrm{to}}\,\1[\,n^{\mathrm{iti}}_t \ge n_{\mathrm{to}}\,]
+      & \mathcal{P}_t = \textsc{iti},\\[3pt]
+    k_{\mathrm{nc}}\, L_t
+      & \mathcal{P}_t = \textsc{no\_cue},\\[3pt]
+    \gamma_t\, k_{\mathrm{early}}\, L_t
+      & \mathcal{P}_t = \textsc{waiting},\\[3pt]
+    \gamma_t\, R\, e^{-\kappa \varepsilon_t}\, L_t + k_{\mathrm{miss}}\,\1[\text{window expired}]
+      & \mathcal{P}_t = \textsc{eligible},\\[3pt]
+    0 & \mathcal{P}_t = \textsc{post}.
+  \end{cases}
+  \label{eq:reward}
+\end{equation}
+\end{definition}
+
+\noindent with
+\begin{itemize}
+  \item $\varepsilon_t = (t - t_{\mathrm{cue}})\,\mathrm{d}t$, the time since cue onset;
+  \item $\kappa = \texttt{discount\_rate}$ (0 by default, i.e.\ no temporal discount);
+  \item $n^{\mathrm{iti}}_t$ the steps elapsed in the current stop-licking period and
+        $n_{\mathrm{to}} = \texttt{iti\_timeout}/\mathrm{d}t$;
+  \item $\gamma_t$ the across-trial value gain,
+        \begin{equation}
+          \gamma_t = \mathrm{clip}\!\left(\exp\bigl(g\,(\rho_{\mathrm{ref}} - \bar\rho_t)\bigr),
+                      \gamma_{\min}, \gamma_{\max}\right),
+        \end{equation}
+        where $\bar\rho_t$ is the rewarded fraction over the last \texttt{reward\_rate\_window}
+        completed cued trials of the same environment, $g = \texttt{reward\_rate\_gain}$ and
+        $\rho_{\mathrm{ref}} = \texttt{reward\_rate\_ref}$. $g = 0$ gives $\gamma_t = 1$.
+        $\gamma_t$ is not observable.
+\end{itemize}
+
+\begin{definition}[Phase transitions]
+The trial starts in \textsc{iti} with a stop-licking duration drawn from an exponential
+distribution of mean \texttt{iti\_mean}, truncated to $[\texttt{iti\_min}, \texttt{iti\_max}]$.
+If \texttt{iti\_restart\_on\_lick} is set, an accepted lick redraws the remaining duration.
+When the period completes, the trial enters \textsc{waiting} (or \textsc{no\_cue} with
+probability \texttt{no\_cue\_prob}) and the cue onset step is recorded. \textsc{waiting}
+becomes \textsc{eligible} when $\varepsilon_t$ reaches the required delay. A lick in
+\textsc{waiting} or \textsc{eligible} moves the trial to \textsc{post} for
+\texttt{post\_lick} seconds, after which the trial ends. The answer window expires
+\texttt{answer\_window} seconds after the delay.
+\end{definition}
+
+\section{Padding and masks}\label{sec:mask}
+
+Trials in a batch end at different steps. Let $D_t \in \{0,1\}$ be $1$ once the episode
+has ended. Two masks are used:
+\begin{align}
+  m^{\mathrm{data}}_t &= 1 - D_{t-1}, \quad m^{\mathrm{data}}_0 = 1
+    && \text{the trial is still running}, \\
+  m_t &= m^{\mathrm{data}}_t\,\1[\mathcal{P}_t \ne \textsc{post}]
+    && \text{the trial is running and the action has a consequence}.
+\end{align}
+After termination the observation is frozen and $r_t = 0$. The return
+(\S\ref{sec:update}) uses $m^{\mathrm{data}}_t$ so that every reward earned in the trial is
+counted; every loss term uses $m_t$ so that the post-lick period, in which no action has
+any effect, contributes no gradient. The normaliser for averages over loss-eligible steps is
+\begin{equation}
+  \mathcal{N} = \sum_{t=0}^{T-1}\sum_{b=1}^{B} m_{t,b}.
+\end{equation}
+
+\section{One update}\label{sec:update}
+
+\paragraph{Step 1: roll out.} For $t = 0,\dots,T-1$ and each $b$, run
+\eqref{eq:state}, \eqref{eq:logits}, \eqref{eq:value}, sample $A_t$, and step the
+environment, storing $\ell_t$, $\mathcal{H}_t$, $V_t$, $h_t$, $r_t$, the masks, and the
+indicator $c^{\textsc{iti}}_t = \1[\mathcal{P}_t = \textsc{iti}]$.
+
+\paragraph{Step 2: shape the reward.}
+\begin{equation}
+  \tilde r_t = c_{\mathrm{scale}}\, r_t - \lambda\, \sg[p_t]\, c^{\textsc{iti}}_t .
+  \label{eq:shaped}
+\end{equation}
+$c_{\mathrm{scale}} = \texttt{reward\_scale}$ rescales the environment reward. $\lambda =
+\texttt{iti\_readout\_penalty}$ (0 by default) charges the lick probability at every ITI
+step; the stop-gradient keeps this a reward rather than a direct penalty on $p_t$.
+
+\paragraph{Step 3: returns.} With discount $\gamma$, computed backwards from $R_T = 0$:
+\begin{equation}
+  R_t = \tilde r_t + \gamma\, m^{\mathrm{data}}_t\, R_{t+1}.
+\end{equation}
+
+\paragraph{Step 4: advantage.} The value head is the baseline, and the advantage is
+standardised over loss-eligible steps:
+\begin{equation}
+  \hat A_t = \sg\!\left[ R_t - V_t \right], \qquad
+  \bar A_t = \frac{\hat A_t - \mu}{s}, \qquad
+  \mu = \frac{1}{\mathcal{N}}\sum_{t,b} m\,\hat A, \qquad
+  s = \sqrt{\frac{1}{\mathcal{N}}\sum_{t,b} m\,(\hat A - \mu)^2} \vee 10^{-6}.
+\end{equation}
+
+\paragraph{Step 5: the loss.}
+\begin{align}
+  \mathcal{L}_{\pi} &= -\frac{1}{\mathcal{N}} \sum_{t,b} m_t\, \ell_t\, \bar A_t
+    && \text{policy gradient (REINFORCE)}, \\
+  \mathcal{L}_{V} &= \frac{1}{\mathcal{N}} \sum_{t,b} m_t\, (V_t - R_t)^{2}
+    && \text{value regression}, \\
+  \mathcal{L}_{a} &= \frac{1}{\mathcal{N}_w} \sum_{t,b} w_t\, \frac{\|h_t\|^2}{N}
+    && \text{activity}, \\
+  \mathcal{L}_{d} &= \frac{1}{\mathcal{N}_w} \sum_{t,b} w_t\, \frac{\|h_t - h_{t-1}\|^2}{N}
+    && \text{activity change}, \\[3pt]
+  \mathcal{L} &= \mathcal{L}_{\pi} + c_V\,\mathcal{L}_{V}
+                 + \lambda_a\,\mathcal{L}_{a} + \lambda_d\,\mathcal{L}_{d},
+\end{align}
+where $w_t = m_t\, c^{\textsc{iti}}_t$ when $\texttt{activity\_scope} = \texttt{iti}$ and
+$w_t = m_t$ when it is \texttt{full}, $\mathcal{N}_w = \sum_{t,b} w_{t,b}$, $c_V =
+\texttt{value\_coef}$, $\lambda_a = \texttt{activity\_penalty}$ and $\lambda_d =
+\texttt{activity\_deriv\_penalty}$. The activity terms are differentiable penalties on
+the hidden state; they modify the network, not the task.
+
+\paragraph{Step 6: the parameter step.}
+\begin{equation}
+  g = \nabla_\theta \mathcal{L}, \qquad
+  g \leftarrow g \cdot \min\!\left(1, \frac{G}{\|g\|_2}\right), \qquad
+  \theta \leftarrow \mathrm{Adam}(\theta, g, \eta),
+\end{equation}
+with $G = \texttt{grad\_clip}$ ($G = 0$ disables clipping) and $\eta = \texttt{lr}$.
+
+\begin{remark}[Credit assignment]
+$\nabla_\theta \mathcal{L}$ is computed by backpropagation through time through the full
+recurrence \eqref{eq:state} within the trial. Since $\hat A_t$ is stop-gradiented, the
+value head is trained only by $\mathcal{L}_V$, and the policy treats $V_t$ as a constant
+baseline.
+\end{remark}
+
+\section{Default constants}\label{sec:consts}
+
+\begin{table}[h]\centering
+\begin{tabular}{llrl}
+\toprule
+Symbol & Code name & Default & Meaning \\
+\midrule
+$\mathrm{d}t$ & \texttt{dt} & $0.02$\,s & step size \\
+$\tau$ & \texttt{tau} & $100$\,ms & unit time constant ($\alpha = 0.2$) \\
+$N$ & \texttt{hidden} & $128$ & recurrent units \\
+$\sigma_{\!\xi}$ & \texttt{noise} & $0.05$ & private noise SD \\
+$g$ & \texttt{g} & $1.0$ & recurrent initialisation gain \\
+$B$ & \texttt{n\_envs} & $16$ & parallel environments \\
+$\eta$ & \texttt{lr} & $4\times10^{-3}$ & Adam learning rate \\
+$\gamma$ & \texttt{gamma} & $1.0$ & return discount \\
+$c_V$ & \texttt{value\_coef} & $0.5$ & weight on $\mathcal{L}_V$ \\
+$G$ & \texttt{grad\_clip} & $1.0$ & gradient-norm clip \\
+$c_{\mathrm{scale}}$ & \texttt{reward\_scale} & $0.1$ & reward rescaling \\
+$\lambda$ & \texttt{iti\_readout\_penalty} & $0$ & per-step ITI penalty on $p_t$ \\
+$\lambda_a$ & \texttt{activity\_penalty} & $0$ ($20$ in \texttt{act}) & activity penalty \\
+$\lambda_d$ & \texttt{activity\_deriv\_penalty} & $0$ & activity-change penalty \\
+$\epsilon$ & \texttt{min\_action\_prob} & $0$ & action-probability floor \\
+\midrule
+$R$ & \texttt{reward} & $15.0$ & reward for a lick in the answer window \\
+$\kappa$ & \texttt{discount\_rate} & $0$ & temporal discount on the reward \\
+$k_{\mathrm{time}}$ & \texttt{time\_penalty} & $-0.05$ & per step \\
+$k_{\mathrm{early}}$ & \texttt{early\_penalty} & $-2.0$ & lick during the delay \\
+$k_{\mathrm{miss}}$ & \texttt{miss\_penalty} & $-2.0$ & answer window expired \\
+$k_{\mathrm{iti}}$ & \texttt{iti\_lick\_penalty} & $-2.0$ & lick in the stop-licking period \\
+$k_{\mathrm{nc}}$ & \texttt{no\_cue\_lick\_penalty} & $-2.0$ & lick on a catch trial \\
+$k_{\mathrm{to}}$ & \texttt{iti\_timeout\_penalty} & $-10.0$ & stop-licking period timed out \\
+$n_{\mathrm{ref}}$ & \texttt{lick\_refractory} & $0.05$\,s & minimum inter-lick interval \\
+$n_{\mathrm{cue}}$ & \texttt{cue\_duration} & $0.6$\,s & transient cue duration \\
+& \texttt{answer\_window} & $0.8$\,s & answer window \\
+& \texttt{post\_lick} & $1.5$\,s & post-lick period \\
+& \texttt{iti\_mean}, \texttt{iti\_min}, \texttt{iti\_max} & $3, 2, 5$\,s & stop-licking period \\
+& \texttt{no\_cue\_prob} & $0.1$ & catch-trial probability \\
+$g$ & \texttt{reward\_rate\_gain} & $1.0$ & across-trial value gain \\
+$\rho_{\mathrm{ref}}$ & \texttt{reward\_rate\_ref} & $0.5$ & reference reward rate \\
+\bottomrule
+\end{tabular}
+\caption{Default values from \texttt{variants.BASE}. The complete list, including the
+delay-schedule parameters, is generated into \texttt{docs/configuration.md}.}
+\end{table}
+
+\end{document}

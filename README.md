@@ -1,164 +1,266 @@
-# timingtask — a cue-triggered lick-timing task and the agents that learn it
+# timingtask
 
-`timingtask` generates trials, trains agents on them, and writes out what the
-agent did and what its units did. It does not analyse the result. That is the
-whole design: **train here, analyse in [`neuralgeom`](../neuralgeom)**, and let
-the two meet at a file rather than at an import.
+A cue-triggered lick-timing task for training and evaluating recurrent
+agents, with a gymnasium environment, a batched supervised interface,
+reinforcement-learning and supervised trainers, and HDF5 export of
+trained-agent states and behaviour.
+
+The task is adapted from the flexible lick-timing paradigm used in
+Yang et al. (2025) and Majumder et al. (2026). Head-fixed mice are trained to
+withhold licking after an auditory cue for an unsignalled delay and are
+rewarded for licking within an answer window after the delay. The delay is
+learned through a two-stage curriculum and is never signalled on the trial;
+it must be inferred from the outcomes of previous trials.
+
+## Task
+
+### Trial structure
 
 ```
-  timingtask                              neuralgeom
-  ──────────                              ──────────
-  generator.py   trials                   geometry/   pullback metric, Jacobians
-  models.py      agents        ──►  .h5   subspace/   Grassmannian trajectories
-  rl.py          REINFORCE   Trajectory   topology/   persistent homology
-  training.py    supervised    schema     dynamics/   fixed points, LDS
-  export.py      the seam                 data/       Trajectory, the contract
+ stop-licking period     cue      delay        answer window      post-lick
+|----------------------|=======|------------|-------------------|-----------|
+trial start            cue onset  delay      window              decisive
+                                  elapses    expires             lick
 ```
 
-`timingtask` imports nothing from `neuralgeom`, and `neuralgeom` imports nothing
-from `timingtask`. `tests/test_standalone.py` is the guard rail on that, and it
-checks imports nested inside functions too, because both packages live in the
-same conda environment and an accidental coupling would work perfectly here and
-break for everyone else.
+| Epoch | Duration | Licking |
+|---|---|---|
+| Stop-licking period (ITI) | truncated exponential; optionally restarted by any lick | penalised |
+| Delay | set by the schedule, measured from cue onset | ends the trial unrewarded (`early`) |
+| Answer window | `answer_window` after the delay | first lick is rewarded (`rewarded`); no lick is a `miss` |
+| Post-lick | `post_lick` after the decisive lick | no contingency |
 
-## The science
+The cue is an input channel that is high for `cue_duration` from cue onset.
+Its duration is independent of the delay, so a lick after the delay elapses
+but while the cue is still on is rewarded. On catch trials (`no_cue_prob`) no
+cue is presented and no timer starts; licks are penalised.
 
-Train a network that can time, then ask whether its dynamics form a **line
-attractor** (Yang et al. 2025 — timing is the integral of a tonic input) or
-**two point attractors** (Majumder et al. 2026 — timing is set by the initial
-condition). `circuits.py` implements both from their released code, and
-`classify()` separates them by counting zero eigenvalues of the Jacobian.
+### Observation
 
-**The task.** A stop-licking period of random length; a cue; a required delay
-measured from cue onset; a lick in the answer window earns water. Licking during
-the stop-licking period, on a catch trial, or before the delay elapses all cost
-the same. Nothing ever tells the network when to lick — there is no target time
-in the loss, and the delay may only be inferred from the cue and from four
-channels carrying the previous trial's outcome.
+| Channel | Description |
+|---|---|
+| `cue` | transient cue, 1 while the cue is on |
+| `cue_step` | tonic cue, 1 from cue onset to trial end (`cue_mode="step"` or `"both"`) |
+| `reward_t-k` | total reward on the k-th previous trial |
+| `action_t-k` | 1 if the k-th previous trial contained a decisive lick |
+| `success_t-k` | +1 rewarded, -1 responded and unrewarded, 0 no response |
+| `first_lick_t-k` | first-lick latency on the k-th previous trial (s) |
 
-**The agent.** One recurrent network, 128 leaky tanh units, whose state is read
-out by a policy head (a lick probability per 20 ms step) and a value head.
-Trained by REINFORCE with a learned baseline over 16 parallel environments, each
-running its own copy of the task and its own curriculum.
+The previous-trial channels are held constant for the whole trial and are
+repeated for `k = 1 ... n_lags`.
 
-See `docs/timing_rl_formulation.tex` for the equations.
+### Actions and reward
 
-## Install
+The action at each step is binary (wait or lick). A refractory period of
+`lick_refractory` seconds limits the lick rate. The reward per step is the
+sum of a per-step cost and the event-dependent terms below.
+
+| Event | Parameter |
+|---|---|
+| Lick inside the answer window | `reward` |
+| Lick during the delay | `early_penalty` |
+| Answer window expires with no lick | `miss_penalty` |
+| Lick during the stop-licking period | `iti_lick_penalty` |
+| Lick on a catch trial | `no_cue_lick_penalty` |
+| Stop-licking period exceeds `iti_timeout` | `iti_timeout_penalty` |
+| Every step while the trial runs | `time_penalty` |
+
+An optional across-trial gain (`reward_rate_gain`) scales the reward and
+the early-lick penalty by a function of the recent reward rate.
+
+### Delay schedules
+
+| Mode | Description |
+|---|---|
+| `fixed` | constant delay |
+| `variable` | a new delay on every trial, from a set or a uniform range |
+| `block` | delays held for a random number of trials per block |
+| `autolearn` | delay increases by `delay_step` when the rewarded fraction over `perf_window` trials exceeds `success_threshold` |
+| `cue_autolearn` | the published protocol: a cue-association stage at a minimal delay, then `autolearn` |
+| `manual` | an explicit per-trial sequence |
+
+The `cue_autolearn` defaults follow the behavioural protocol: 0.1 s initial
+delay, 0.1 s increments, promotion at 30% rewarded over the last 100 trials.
+
+## Installation
 
 ```bash
-pip install -e .                 # core: numpy, torch, h5py
-pip install -e '.[full]'         # + matplotlib, scikit-learn, gymnasium
+pip install -e .            # core: numpy, torch, h5py
+pip install -e '.[full]'    # adds gymnasium, matplotlib, scikit-learn
 ```
 
-The core is deliberately thin — the task generator is a plain numpy state
-machine and needs no gym; the trainers need torch; `export.py` needs h5py. The
-figures, the PCA in the state plots and the gymnasium `Env` wrapper are extras.
+Python 3.10 or later. The `gym` extra is required for `TimingTaskEnv`, the
+`plots` extra for `timingtask.plots`.
 
-It installs cleanly into the same environment as `neuralgeom` (the dependency
-set is a subset of that one, and numpy stays pinned `<2` for exactly that
-reason), so both are importable side by side and the handoff needs no second
-environment.
+## Usage
 
-## Layout
+### gymnasium environment
 
-```
-timingtask/
-  config.py      three dataclasses; every number, no logic
-  generator.py   the trial state machine — the TIMER and the CUE CHANNEL are
-                 independent axes, not a sequence of phases
-  scheduler.py   the delay curriculum
-  monitor.py     JSONL / in-memory trial logging
-  env.py         gymnasium wrapper                      (extra: gym)
-  models.py      the agent zoo — recurrent cores behind one `step` interface
-  contract.py    TaskSpec / TrialBatch / Task, the batched-trial interface
-  rl.py          REINFORCE with a learned baseline; ActorCritic; attach_states
-  training.py    the task-agnostic supervised trainer
-  supervised.py  the task as a batched, supervised Task
-  variants.py    named configurations + the CLI
-  plots.py       the diagnostic figures                 (extra: plots)
-  circuits.py    the two published timing models, re-derived numerically
-  export.py      states + behaviour → Trajectory HDF5   ← the seam
+```python
+from timingtask import TimingTaskConfig, SchedulerConfig
+from timingtask.env import TimingTaskEnv
 
-tests/     153 tests; `-m "not slow"` skips the one that trains a network
-docs/      the formulation and the generated config reference
-examples/  timing_debug.py (step-by-step trial inspection and a supervised run, as
-           `# %%` cells) and timing_rnn.ipynb (supervised and RL training walkthrough)
+env = TimingTaskEnv(TimingTaskConfig(), SchedulerConfig(mode="fixed", fixed_delay=1.0),
+                    trials_per_episode=100)
+obs, info = env.reset(seed=0)
+obs, reward, terminated, truncated, info = env.step(0)   # 0 = wait, 1 = lick
 ```
 
-## Run it
+An episode is a session of `trials_per_episode` trials. Episode end is
+reported as `truncated`; the task has no terminal state. Completed trials
+are delivered as records through `info["record"]` and through any attached
+`Monitor`.
+
+### Reinforcement learning
+
+```python
+import torch
+from timingtask import TimingTaskConfig, SchedulerConfig, ObservationConfig
+from timingtask.models import VanillaRNN
+from timingtask.rl import ActorCritic, RLTrainer
+from timingtask.export import save_trajectory
+
+task = TimingTaskConfig(answer_window=0.8, iti_mean=3.0, iti_min=2.0, iti_max=5.0,
+                        iti_restart_on_lick=False, reward=15.0, early_penalty=-2.0,
+                        iti_lick_penalty=-2.0, no_cue_lick_penalty=-2.0)
+sched = SchedulerConfig(mode="cue_autolearn", cue_association_success_threshold=0.3)
+
+trainer = RLTrainer(task, sched, ObservationConfig(), n_envs=16, lr=4e-3,
+                    activity_penalty=20.0)
+core = VanillaRNN(trainer.obs_size, 128, 1, tau=100.0, dt=20.0, noise=0.05)
+model = ActorCritic(core)
+
+hist = trainer.train(model, steps=4000, target_delay=1.0, patience=40)
+
+records = trainer.evaluate(model, n_trials=400, collect_states=True)
+save_trajectory(records, "runs/agent.h5", condition="delay",
+                W=model.core.rec.weight.detach().numpy())
+```
+
+The agent is a leaky tanh recurrent network with a policy head and a value
+head, trained by REINFORCE with a learned baseline (Song, Yang and Wang,
+2017). No target lick time enters the objective. `docs/formulation.tex`
+gives the full specification of one training update.
+
+### Supervised training
+
+```python
+from timingtask import TimingTaskConfig, SchedulerConfig
+from timingtask.supervised import TimingTask
+from timingtask.models import make_model
+from timingtask.training import train
+
+task = TimingTask(TimingTaskConfig(answer_window=2.0, post_lick=0.0),
+                  SchedulerConfig(mode="variable", min_delay=0.4, max_delay=1.2))
+model = make_model("vanilla", task.spec, hidden_size=128, dt=task.dt)
+train(model, task, steps=2000)
+```
+
+The supervised task uses a fixed epoch structure with a withhold output and a
+ramp-to-threshold lick output, following the convention of Yang et al.
+(2019).
+
+### Command line
 
 ```bash
 python -m timingtask.variants act --out runs/
+python -m timingtask.variants act --phases staged --out runs/
+python -m timingtask.variants --describe > docs/configuration.md
 ```
 
-Writes the training history, the weights, every trial record, and eight figures:
-the optimiser view, the two heads, behaviour during training, trial history and
-lick-time distributions, network internals, and three frozen-weight test
-conditions (a fixed 1 s delay, a switching 1.0/1.8 s block, and a probe where
-the curriculum keeps running while the weights do not change).
+`timingtask.variants` holds named configurations as deltas from a base
+configuration. A run writes the training history, the model weights, every
+trial record, the per-step time series of the evaluation trials and the
+diagnostic figures to the output directory. `docs/configuration.md` lists
+every parameter of the default configuration.
 
-```bash
-python -m timingtask.variants --describe > docs/timing_config_reference.md
+Example scripts are in `examples/`.
+
+## Outputs
+
+### Trial records
+
+Every completed trial produces a flat dict with, among other fields,
+`outcome`, `delay`, `cue_onset_step`, `first_lick_s`, `decisive_lick_s`,
+`lick_times_s`, `n_iti_licks`, `trial_reward`, `trial_steps`,
+`training_stage` and the previous-trial channels the agent observed.
+Records can be kept in memory (`MemoryMonitor`), appended to a JSONL file
+(`JSONLMonitor`) or converted to columnar arrays (`records_to_arrays`).
+
+With `collect_states=True`, `RLTrainer.evaluate`, `test` and `probe`
+attach the per-step hidden state, observation, policy readout and value
+estimate to each record.
+
+### HDF5 export
+
+`timingtask.export.save_trajectory` writes records with attached states to a
+single HDF5 file:
+
+| Dataset / attribute | Shape | Content |
+|---|---|---|
+| `X` | `(n_trials, T, N)` | hidden states, NaN-padded |
+| `time` | `(T,)` | time in seconds relative to cue onset |
+| `inputs` | `(n_trials, T, n_in)` | observation vectors |
+| `outputs` | `(n_trials, T, 2)` | policy readout (lick minus wait logit) and value |
+| `condition` | `(n_trials,)` | per-trial label (default: required delay) |
+| `W` | `(N, N)` | recurrent weights, if given |
+| `aux/<key>` | `(n_trials, ...)` | per-trial behaviour; `aux/n_steps` is the number of valid steps |
+| `dt`, `tau`, `meta` | attrs | step size, time constant, JSON metadata |
+
+Trials are aligned to cue onset by default (`align="start"` aligns to trial
+start). Catch trials are aligned to the step at which the cue would have
+occurred.
+
+## Package layout
+
+```
+timingtask/
+  config.py      TimingTaskConfig, SchedulerConfig, ObservationConfig
+  generator.py   trial state machine
+  scheduler.py   delay schedules and the training curriculum
+  monitor.py     trial-record logging
+  env.py         gymnasium environment
+  models.py      VanillaRNN, GRUModel, LSTMModel
+  contract.py    TaskSpec, TrialBatch, Task
+  rl.py          ActorCritic, RLTrainer, rollout, behavioural summaries
+  training.py    supervised trainer
+  supervised.py  TimingTask (supervised interface)
+  variants.py    named configurations and command-line interface
+  plots.py       behavioural, network and training figures
+  circuits.py    published low-dimensional timing circuits
+  export.py      HDF5 export
+tests/           pytest suite (`-m "not slow"` skips the training test)
+examples/        train_rl.py, train_supervised.py, inspect_task.py
+docs/            formulation.tex, configuration.md
 ```
 
-Regenerates the configuration reference from the live code.
+## Reference circuits
 
-## Handing a trained agent to the geometry side
+`timingtask.circuits` implements the candidate circuit models of Yang et al.
+(2025, Extended Data Fig. 1) from the released connectivity matrices, and the
+two-attractor model of Majumder et al. (2026, Fig. 4). `classify` reports the
+dynamical class of each circuit from its Jacobian spectrum and
+`perturbation_signature` reproduces the published perturbation protocols.
 
-```python
-from timingtask.export import save_trajectory
+## References
 
-recs = trainer.evaluate(model, n_trials=512, collect_states=True)
-save_trajectory(recs, "runs/act_probe.h5",
-                condition="delay",          # the per-trial label
-                W=model.core.rec.weight.detach().cpu().numpy(),
-                generator="timingtask.rl")
-```
-
-```python
-from neuralgeom.data import load_trajectory
-
-traj = load_trajectory("runs/act_probe.h5")
-traj.X            # (n_trials, T, N)   recurrent states, cue-aligned
-traj.inputs       # (n_trials, T, n_in) the drive the network saw
-traj.outputs      # (n_trials, T, 2)   [policy readout, critic value]
-traj.condition    # (n_trials,)        the required delay on that trial
-traj.aux["n_steps"]   # per-trial length; everything past it is NaN
-```
-
-`collect_states=True` is required — without it the rollout is discarded and only
-the behavioural summary survives, and `records_to_trajectory` says so rather
-than writing an empty file.
-
-Three things the export decides, and why:
-
-- **Trials are padded, not truncated.** Trial length is an *outcome* here (a
-  trial ends at the decisive lick), so truncating to the shortest would throw
-  away exactly the trials where the agent waited.
-- **Padding is NaN, never zero.** Zero is a perfectly good hidden state and
-  would otherwise be analysed as one. `aux["n_steps"]` gives the mask.
-- **Alignment defaults to the cue.** The stop-licking period is resampled every
-  trial and restarts on every lick, so trial start sits at a random distance
-  from the cue; averaging in that frame smears everything locked to the timer.
-  Catch trials align to where the cue *would* have been, so they stay
-  comparable. A trial that never reached a cue is dropped and counted in
-  `meta["n_unaligned_dropped"]`.
-
-## Adding to this repository
-
-**A new agent** goes in `models.py` and in `MODELS`. Nothing that trains names a
-class — `rl.ActorCritic` wraps whatever core it is handed and `training.train`
-takes any model with the same `step` — so nothing else has to change.
-
-**A new training method** goes in its own module next to `rl.py`, and should
-attach its per-trial series with `rl.attach_states` (or the same key names) so
-`export.py` works on its output unchanged.
-
-**A new rollout path** must call `attach_states`. It used to be written out
-three times inline, and two of the three copies quietly omitted the hidden
-states, so `collect_states=True` returned nothing usable from `switching_test`
-and `probe`.
+- Yang, Z., Inagaki, M., Gerfen, C. R., Fontolan, L. and Inagaki, H. K.
+  (2025). Integrator dynamics in the cortico-basal ganglia loop for flexible
+  motor timing. *Nature* 649, 1244-1253.
+  https://doi.org/10.1038/s41586-025-09778-2
+- Majumder, S., Hirokawa, K., Yang, Z., Jain, A., Paletzki, R., Gerfen, C. R.,
+  Fontolan, L., Romani, S., Yasuda, R. and Inagaki, H. K. (2026).
+  Complementary roles of cell-type-specific plasticity in shaping neocortical
+  dynamics for learning action timing. *Nature Communications* 17, 8353.
+  https://doi.org/10.1038/s41467-026-74869-1
+- Song, H. F., Yang, G. R. and Wang, X.-J. (2017). Reward-based training of
+  recurrent neural networks for cognitive and value-based tasks. *eLife* 6,
+  e21492. https://doi.org/10.7554/eLife.21492
+- Yang, G. R., Joglekar, M. R., Song, H. F., Newsome, W. T. and Wang, X.-J.
+  (2019). Task representations in neural networks trained to perform many
+  cognitive tasks. *Nature Neuroscience* 22, 297-306.
+  https://doi.org/10.1038/s41593-018-0310-2
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

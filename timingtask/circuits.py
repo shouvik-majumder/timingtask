@@ -1,41 +1,34 @@
 """
-timingtask.circuits — the published candidate circuits.
-====================================================================
+timingtask.circuits: published low-dimensional timing circuits.
 
-Six 4-unit models from Yang et al., *Nature* 2025 (Extended Data Fig. 1) and the
-two-attractor model from Majumder et al., *Nat Commun* 2026 (Fig. 4g). These are
-competing hypotheses about how a timing ramp is generated, and the paper
-discriminates them with two optogenetic protocols. Reimplemented here so a
-task-trained RNN can be compared against all of them with the same fixed-point
-and subspace tools.
+Reference implementations of the candidate circuit models considered in
+Yang et al. (2025, *Nature* 649:1244-1253, Extended Data Fig. 1) and of the
+two-attractor model of Majumder et al. (2026, *Nat. Commun.* 17:8353,
+Fig. 4). They are provided so that a task-trained network can be compared
+against the published hypotheses with common tools.
 
-Matrices are transcribed from `github.com/inagaki-lab/Yang_et_al_2024`
-(`codeForEDF1_github/network.py`) -- the published Methods contain no equations.
-Nothing here is reconstructed; `verify()` re-derives every spectrum.
+The Yang et al. circuits are four-unit rate networks (units 1-2 cortex, units
+3-4 striatum). Connectivity matrices and simulation parameters are transcribed
+from the released code (``github.com/inagaki-lab/Yang_et_al_2024``,
+``codeForEDF1_github/network.py``); :func:`verify` re-derives each model's
+spectrum from those matrices.
 
-THE DISCRIMINATING LOGIC
-------------------------
-From the paper: *"silencing an area supplying essential input for an integrator
-will pause integration in the recipient area, delaying action by the silencing
-duration"* versus *"Silencing an area serving as an integrator may reset the
-ramping dynamics, delaying action beyond the silencing duration."*
+Perturbation signatures
+-----------------------
+Yang et al. distinguish the circuits by how a transient perturbation shifts
+the lick time as a function of trial duration:
 
-So the measurement is not "does the lick time shift" but **how the shift scales
-with trial duration**:
+  PAUSE   a constant time shift equal to the perturbation duration,
+          independent of trial length (the state is preserved; the clock stops).
+  REWIND  a constant amplitude setback, so the time shift grows with trial
+          duration (the state is pushed back along the manifold).
 
-  PAUSE   a constant time shift equal to the silencing duration, the same on
-          short and long trials. The state is preserved; only the clock stops.
-  REWIND  a constant *amplitude* setback, so the time shift scales with the
-          trial's duration. The state itself is pushed back down the manifold.
-
-The accepted model is the only one that pauses under ALM silencing and rewinds
-under striatal inhibition. That asymmetry has a linear-algebra explanation: the
-ALM silencing direction is orthogonal to the slow mode's left eigenvector
-(off-manifold, invisible to the timer), while the striatal one is parallel to it.
+:func:`perturbation_signature` reproduces both protocols for each model and
+:func:`compare_all` tabulates the results.
 
     >>> from timingtask import circuits as C
-    >>> C.classify("data").summary()
-    >>> C.compare_all()
+    >>> print(C.classify("data").summary())
+    >>> print(C.compare_all())
 """
 from __future__ import annotations
 
@@ -54,17 +47,17 @@ INH_START, INH_DUR, INH_RAMP = 1100, 300, 300
 
 @dataclass
 class Circuit:
-    """One candidate circuit. Units 1-2 are ALM, units 3-4 striatum."""
+    """One candidate circuit. Units 1-2 are cortical (ALM), units 3-4 striatal."""
     name: str
     paper_name: str
     W: np.ndarray
     input_vector: np.ndarray
     h_init: np.ndarray
     trial_gains: Tuple[float, ...]
-    alm_silencing: float          # current to units 1-2
-    str_inhibition: float         # current to unit 3
-    readout_unit: int = 2         # 0-based; which unit's ramp crosses threshold
-    ramp_input: bool = False      # externally_driven uses a ramp, not a step
+    alm_silencing: float          # current applied to units 1-2
+    str_inhibition: float         # current applied to unit 3
+    readout_unit: int = 2         # 0-based; the unit whose rate is thresholded
+    ramp_input: bool = False      # externally_driven uses a ramp input, not a step
     verdict: str = ""
     note: str = ""
 
@@ -75,75 +68,69 @@ class Circuit:
 
 
 # --------------------------------------------------------------------------- #
-# The zoo. Panel letters are Extended Data Fig. 1 of Yang et al. 2025.
+# The candidate circuits. Panel letters refer to Extended Data Fig. 1 of
+# Yang et al. (2025).
 # --------------------------------------------------------------------------- #
 MODELS: Dict[str, Circuit] = {
     "externally_driven": Circuit(
-        "externally_driven", "ED1a — externally driven",
+        "externally_driven", "ED1a: externally driven",
         [[.4, -.3, .6, 0], [-.3, .4, .6, 0], [.6, 0, .4, -.3], [.6, 0, -.3, .4]],
         [0.5, 0, 0, 0], [5, 5, 5, 5], (8.5, 7, 5.8, 4.8, 4), -10.0, -0.4,
         ramp_input=True,
-        verdict="REJECTED — predicts no lick-time shift under either protocol; "
-                "the data show a 0.47 s shift after ALM silencing.",
-        note="No slow mode at all. The Jacobian is DEFECTIVE (eigenvalue -0.3 "
-             "has algebraic multiplicity 3, geometric 2), so activity is slaved "
-             "to the input and snaps back the instant a perturbation ends."),
+        verdict="Rejected: predicts no lick-time shift under either protocol.",
+        note="No slow mode. The Jacobian is defective (eigenvalue -0.3 with "
+             "algebraic multiplicity 3, geometric multiplicity 2); activity "
+             "follows the input and returns to baseline when a perturbation ends."),
     "two_region_integrator": Circuit(
-        "two_region_integrator", "ED1b — distributed",
+        "two_region_integrator", "ED1b: distributed integrator",
         [[.4, -.3, .3, .6], [-.3, .4, 0, .9], [.9, 0, .4, -.3], [.6, .3, -.3, .4]],
         [3, 0, 0, 0], [5, 5, 5, 5], (14, 11, 8.6, 7.2, 6), -0.25, -0.3,
-        verdict="REJECTED — ALM silencing rewinds (shift scales 0.97->1.58 s "
-                "with trial duration) where the data show a pause.",
-        note="TWO zero eigenvalues: a 2-D PLANE attractor spanning both regions. "
-             "The ALM silencing direction has overlap -0.50 with it, so ALM is "
-             "part of the timer rather than an input to it."),
+        verdict="Rejected: cortical silencing rewinds rather than pauses.",
+        note="Two zero eigenvalues: a two-dimensional plane attractor spanning "
+             "both regions. The cortical silencing direction overlaps the "
+             "integration manifold."),
     "two_integrator": Circuit(
-        "two_integrator", "ED1c — redundant",
+        "two_integrator", "ED1c: redundant integrators",
         [[.7, -.3, .4, 0], [-.3, .7, .4, 0], [.4, 0, .7, -.3], [.4, 0, -.3, .7]],
         [3, 0, 0, 0], [5, 5, 5, 5], (14, 11, 8.6, 7.2, 6), -10.0, -0.1,
-        verdict="REJECTED — ALM silencing resets rather than pauses: a constant "
-                "1.15 s shift, about twice the 0.6 s silencing duration.",
-        note="Two independent line attractors, one per region. Both left "
-             "eigenvectors are antisymmetric in units 1-2, so common-mode ALM "
-             "inhibition is EXACTLY orthogonal to them -- yet the rectification "
-             "drives the striatal projection onto the r=0 rail, which is a reset."),
+        verdict="Rejected: cortical silencing resets rather than pauses.",
+        note="Two independent line attractors, one per region. Common-mode "
+             "cortical inhibition is orthogonal to both left eigenvectors, "
+             "but rectification drives the striatal projection to zero."),
     "one_integrator_follower_opposite": Circuit(
-        "one_integrator_follower_opposite", "ED1d — ALM integrator, STR follower",
+        "one_integrator_follower_opposite", "ED1d: cortical integrator, striatal follower",
         [[.7, -.3, .5, 0], [-.3, .7, .5, 0], [.5, 0, .6, -.3], [.5, 0, -.3, .6]],
         [2, 0, 0, 0], [5, 5, 5, 5], (14, 11, 8.6, 7.2, 6), -10.0, -0.2,
-        verdict="REJECTED — striatal inhibition is near-null (shift <= 0.16 s, "
-                "falling to 0 on long trials) where the data show 1.0 s.",
-        note="Line attractor in ALM alone: the left eigenvector is [-0.707, "
-             "0.707, 0, 0], with EXACTLY ZERO striatal weight. The striatum "
-             "cannot touch the timer, which is the prediction that fails."),
+        verdict="Rejected: striatal inhibition has almost no effect.",
+        note="Line attractor in cortex alone; the left eigenvector has zero "
+             "striatal weight, so striatal input cannot affect the timer."),
     "one_integrator_follower_opposite_leaky": Circuit(
-        "one_integrator_follower_opposite_leaky", "ED1e — ALM leaky integrator",
+        "one_integrator_follower_opposite_leaky", "ED1e: cortical leaky integrator",
         [[.69, -.3, .3, .4], [-.3, .69, 0, .4], [0, 0, .4, 0], [.4, 0, 0, .3]],
         [0, 0, 10, 0], [5, 5, 5, 5], (14, 11, 8.6, 7.2, 6), -10.0, -0.2,
         readout_unit=3,
-        verdict="REJECTED — gets the striatal rewind but cannot reproduce the "
-                "ALM pause.",
-        note="A LEAKY integrator (slowest eigenvalue -0.01, leak tau = 1.00 s), "
-             "so no exact zero. The only model whose input arrives in striatum."),
+        verdict="Rejected: reproduces the striatal rewind but not the cortical pause.",
+        note="Leaky integrator (slowest eigenvalue -0.01, leak time constant "
+             "1.0 s). The only model whose input arrives in striatum."),
     "data": Circuit(
-        "data", "ED1f — striatal integrator, ALM input/follower",
+        "data", "ED1f: striatal integrator, cortical input",
         [[.4, 0, 0, 0], [0, .3, .4, 0], [.03, .4, .7, -.3], [0, .4, -.3, .7]],
         [50, 0, 0, 0], [0, 5, 5, 5], (14, 11, 8.6, 7.2, 6), -10.0, -0.07,
-        verdict="ACCEPTED — the only model that pauses under ALM silencing and "
-                "rewinds under striatal inhibition.",
-        note="Perfect integrator: exactly one zero Jacobian eigenvalue. The "
-             "integrated variable is the striatal DIFFERENCE mode, left "
-             "eigenvector [0.035, 0, 0.707, -0.707]. Unit 1 is a pure input "
-             "relay (baseline 0) feeding STR unit 3 with weight 0.03 -- that "
-             "single number sets the on-manifold gain and hence the ramp slope."),
+        verdict="Accepted: pauses under cortical silencing and rewinds under "
+                "striatal inhibition.",
+        note="Perfect integrator with one zero Jacobian eigenvalue. The "
+             "integrated variable is the striatal difference mode, left "
+             "eigenvector [0.035, 0, 0.707, -0.707]. Unit 1 relays the input "
+             "to striatal unit 3 with weight 0.03, which sets the ramp slope."),
 }
-# alias so paper panel letters work too
+# Panel letters as aliases.
 PANELS = {"a": "externally_driven", "b": "two_region_integrator",
           "c": "two_integrator", "d": "one_integrator_follower_opposite",
           "e": "one_integrator_follower_opposite_leaky", "f": "data"}
 
 
 def get(name: str) -> Circuit:
+    """Look up a circuit by name or by panel letter."""
     return MODELS[PANELS.get(name, name)]
 
 
@@ -152,16 +139,16 @@ def get(name: str) -> Circuit:
 # --------------------------------------------------------------------------- #
 def simulate(c: Circuit, gain: float, *, inhibition: Optional[np.ndarray] = None,
              n_steps: int = N_STEPS) -> np.ndarray:
-    """Run one trial. Returns rates ``(4, n_steps)``.
+    """Simulate one trial. Returns rates of shape ``(4, n_steps)``.
 
-    Faithful port of ``simulation.py::iteration``:
-    ``tau dh/dt = -h + W r + I``, ``r = clip(h, 0, 100)``, tau = 10 ms, dt = 1 ms.
+    Dynamics follow the released code: ``tau dh/dt = -h + W r + I``,
+    ``r = clip(h, 0, RMAX)``, tau = 10 ms, dt = 1 ms.
     """
     r0 = np.clip(c.h_init, 0, RMAX)
     Ithresh = -(-r0 + c.W @ r0)            # holds the baseline as a fixed point
     I = np.zeros((4, n_steps))
     amp = c.input_vector * gain / CUE_IDX
-    if c.ramp_input:                        # externally_driven: a ramp, not a step
+    if c.ramp_input:
         ramp = np.linspace(0, 1, n_steps - CUE_IDX)
         I[:, CUE_IDX:] = amp[:, None] * ramp[None, :]
     else:
@@ -178,8 +165,8 @@ def simulate(c: Circuit, gain: float, *, inhibition: Optional[np.ndarray] = None
 
 
 def inhibition_current(c: Circuit, kind: str, n_steps: int = N_STEPS) -> np.ndarray:
-    """The two optogenetic protocols: 300 ms at full strength, then a 300 ms
-    linear ramp-down. ``kind`` is 'alm' (units 1-2) or 'str' (unit 3)."""
+    """Perturbation current: full strength for 300 ms, then a 300 ms linear
+    ramp-down. ``kind`` is ``'alm'`` (units 1-2) or ``'str'`` (unit 3)."""
     inh = np.zeros((4, n_steps))
     s = c.alm_silencing if kind == "alm" else c.str_inhibition
     units = [0, 1] if kind == "alm" else [2]
@@ -190,32 +177,27 @@ def inhibition_current(c: Circuit, kind: str, n_steps: int = N_STEPS) -> np.ndar
 
 
 def ramp_mode(r: np.ndarray, units: Tuple[int, int]) -> np.ndarray:
-    """Project onto the unit-norm ramp direction, as the paper's code does:
-    the (end - cue) difference vector within a region."""
+    """Project activity onto the unit-norm ramp direction within a region,
+    defined as the (end - cue) difference vector."""
     sl = slice(units[0], units[1])
     v = r[sl, -1] - r[sl, CUE_IDX]
     n = np.linalg.norm(v)
     return (r[sl].T @ (v / n)) if n > 1e-12 else np.zeros(r.shape[1])
 
 
-LICK_RATE = 10.0        # Hz; `target_threshold` in the released main.py
+LICK_RATE = 10.0        # Hz; ``target_threshold`` in the released code
 
 
 def lick_time(r: np.ndarray, readout_unit: int = 2,
               rate: float = LICK_RATE) -> float:
-    """First time the readout unit's firing rate crosses ``rate``, in seconds
-    from cue. NaN if it never does.
-
-    The released code thresholds the RATE of a single striatal unit at 10 Hz
-    (baseline 5 Hz), not a normalised projection -- getting this wrong makes
-    every model look like it never licks.
-    """
+    """Time at which the readout unit's rate first reaches ``rate``, in
+    seconds from the cue. NaN if it never does."""
     idx = np.flatnonzero(r[readout_unit, CUE_IDX:] >= rate)
     return float(idx[0] * DT) if idx.size else float("nan")
 
 
 # --------------------------------------------------------------------------- #
-# Spectral classification -- computed, never asserted
+# Spectral classification
 # --------------------------------------------------------------------------- #
 @dataclass
 class Spectrum:
@@ -245,7 +227,7 @@ class Spectrum:
             s.append(f"  carried by: ALM {self.alm_weight:.3f} / "
                      f"STR {self.str_weight:.3f}")
             for k, v in self.overlaps.items():
-                tag = ("ON-manifold" if abs(v) > 0.2 else
+                tag = ("on-manifold" if abs(v) > 0.2 else
                        "off-manifold" if abs(v) < 0.05 else "weakly on")
                 s.append(f"  overlap with {k:<16} = {v:+.4f}   {tag}")
         return "\n".join(s)
@@ -253,19 +235,18 @@ class Spectrum:
 
 def classify(name: str, *, zero_tol: float = 1e-9,
              near_tol: float = 0.05) -> Spectrum:
-    """Eigen-decompose a circuit and locate its integration manifold.
+    """Eigen-decompose a circuit's Jacobian and locate its integration
+    manifold.
 
-    A perfect integrator has exactly one zero Jacobian eigenvalue -- a line
-    attractor. The LEFT eigenvector of that mode says which units carry the
-    integrated variable, and an input's overlap with it says whether that input
-    is integrated (on-manifold) or merely amplifies activity without affecting
-    the timer (off-manifold).
+    A perfect integrator has exactly one zero Jacobian eigenvalue (a line
+    attractor). The left eigenvector of that mode identifies the integrated
+    variable; an input's overlap with it indicates whether the input is
+    integrated (on-manifold) or leaves the timer unaffected (off-manifold).
     """
     c = get(name)
     w, vr = np.linalg.eig(c.W)
     J = -np.eye(4) + c.W
     ej, VR = np.linalg.eig(J)
-    _, VL = np.linalg.eig(J.T)
 
     real = ej.real
     n_zero = int(np.sum(np.abs(ej) < zero_tol))
@@ -278,9 +259,7 @@ def classify(name: str, *, zero_tol: float = 1e-9,
     alm = strw = 0.0
     ov: Dict[str, float] = {}
     if abs(ej[k]) < near_tol:
-        left = np.real(VL[:, int(np.argmin(np.abs(np.linalg.eigvals(J.T) - ej[k])))]) \
-            if False else np.real(VL[:, k])
-        # match the left eigenvector to THIS eigenvalue, not by position
+        # Match the left eigenvector to this eigenvalue rather than by index.
         ejT, VLT = np.linalg.eig(J.T)
         kk = int(np.argmin(np.abs(ejT - ej[k])))
         left = np.real(VLT[:, kk])
@@ -294,28 +273,25 @@ def classify(name: str, *, zero_tol: float = 1e-9,
             ov[label] = float(left @ v / nv) if nv > 1e-12 else 0.0
 
     if n_zero == 1:
-        cl = "PERFECT INTEGRATOR — 1-D line attractor"
+        cl = "PERFECT INTEGRATOR: 1-D line attractor"
     elif n_zero >= 2:
         cl = f"{n_zero}-D PLANE ATTRACTOR"
     elif n_near >= 1:
         cl = f"LEAKY INTEGRATOR (tau = {leak:.2f} s)"
     else:
-        cl = "NO SLOW MODE — externally driven"
+        cl = "NO SLOW MODE: externally driven"
     return Spectrum(name, w, ej, n_zero, n_near, leak, left, right, alm, strw,
                     ov, cl)
 
 
 # --------------------------------------------------------------------------- #
-# Perturbation signatures -- the discriminating measurement
+# Perturbation signatures
 # --------------------------------------------------------------------------- #
 def perturbation_signature(name: str) -> Dict[str, object]:
-    """Run both protocols on all five trial types and classify the result.
-
-    PAUSE  -> constant time shift, equal to the silencing duration, independent
-              of trial length. The clock stopped; the state survived.
-    REWIND -> constant AMPLITUDE setback, so the time shift grows with trial
-              duration. The state was pushed back down the manifold.
-    """
+    """Run both perturbation protocols on all trial types and classify the
+    lick-time shift as PAUSE (state-independent), REWIND (state-dependent),
+    RESET (state-independent but much longer than the perturbation), no
+    effect, or abolished licking."""
     c = get(name)
     ctrl = [simulate(c, g) for g in c.trial_gains]
     base = np.array([lick_time(r, c.readout_unit) for r in ctrl])
@@ -329,24 +305,16 @@ def perturbation_signature(name: str) -> Dict[str, object]:
         d = lt - base
         ok = np.isfinite(d) & np.isfinite(base)
 
-        # THE DISCRIMINATING MEASUREMENT. A pause is STATE-INDEPENDENT: the same
-        # shift on short and long trials, so the shift does not scale with trial
-        # duration. A rewind is STATE-DEPENDENT: a constant amplitude setback,
-        # which takes longer to re-traverse on a slow (long) trial, so the shift
-        # grows with control lick time. Regress shift on control lick time; the
-        # SLOPE is the diagnostic, not the spread -- one outlying condition
-        # inflates the spread without making the effect state-dependent.
+        # Regress the shift on the control lick time. The slope measures
+        # state dependence: ~0 for a pause, > 0 for a rewind.
         slope = float("nan")
         if ok.sum() >= 2:
             slope = float(np.polyfit(base[ok], d[ok], 1)[0])
         n_lick = int(np.isfinite(lt).sum())
         mean_shift = float(np.nanmean(d[ok])) if ok.any() else float("nan")
 
-        # Second criterion, and the paper is explicit about it: a pause delays
-        # action BY the silencing duration; a reset delays it BEYOND that.
-        # A state-independent shift of twice the duration is a reset -- the
-        # state was driven to a rail and had to be rebuilt from scratch -- not
-        # a clock that stopped and restarted.
+        # A pause delays action by about the perturbation duration; a
+        # state-independent shift far exceeding it is a reset.
         dur = (INH_DUR + INH_RAMP / 2) * DT          # 0.45 s effective
         if not ok.any():
             sig = "abolishes licking"
@@ -365,7 +333,8 @@ def perturbation_signature(name: str) -> Dict[str, object]:
 
 
 def compare_all() -> str:
-    """One table, every model: dynamical class and both perturbation signatures."""
+    """Tabulate the dynamical class and both perturbation signatures of every
+    model."""
     hdr = ("model", "dynamical class", "ALM silencing", "STR inhibition")
     w = (40, 32, 32, 32)
     rows = ["", "".join(h.ljust(k) for h, k in zip(hdr, w)), "-" * sum(w)]
@@ -381,21 +350,19 @@ def compare_all() -> str:
     rows += [
         "",
         "Slope = d(shift) / d(control lick time), the state-dependence measure.",
-        "  ~0  the shift is the same on short and long trials -> PAUSE: the clock",
-        "      stopped but the state survived.",
-        "  >0  the shift grows with trial duration -> REWIND: a constant amplitude",
-        "      setback, which takes longer to re-traverse on a slow trial.",
+        "  ~0  the same shift on short and long trials: PAUSE.",
+        "  >0  the shift grows with trial duration: REWIND.",
         "",
-        "The mice show a PAUSE of ~0.47 s under ALM silencing and a",
-        "state-dependent REWIND of ~1.0 s under striatal D1-SPN inhibition.",
-        "Only 'data' produces that pair -- which is the paper's argument.",
+        "Yang et al. (2025) report a pause of ~0.47 s under ALM silencing and a",
+        "state-dependent rewind of ~1.0 s under striatal inhibition; only the",
+        "'data' model reproduces both.",
     ]
     return "\n".join(rows)
 
 
 def verify() -> List[str]:
-    """Re-derive the published spectra. These numbers come from the released
-    matrices, not from the paper text."""
+    """Re-derive the published spectral properties from the connectivity
+    matrices. Raises ``AssertionError`` on a mismatch; returns a summary."""
     msgs = []
     d = classify("data")
     assert d.n_zero == 1, "the accepted model must be a perfect integrator"
@@ -410,7 +377,7 @@ def verify() -> List[str]:
                       ("one_integrator_follower_opposite", 1)):
         s = classify(n)
         assert s.n_zero == expect, (n, s.n_zero, expect)
-        msgs.append(f"{n}: {s.n_zero} zero mode(s) — {s.classification}")
+        msgs.append(f"{n}: {s.n_zero} zero mode(s): {s.classification}")
     e = classify("one_integrator_follower_opposite_leaky")
     assert e.n_zero == 0 and e.leak_tau is not None
     msgs.append(f"leaky: no exact zero, leak tau = {e.leak_tau:.3f} s")
@@ -421,18 +388,17 @@ def verify() -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Majumder et al. 2026 -- the two-attractor model, for contrast
+# Majumder et al. (2026): the two-attractor model
 # --------------------------------------------------------------------------- #
 def two_attractor_field(x, y, *, a1=(1.5, 1.5), a2=(15.0, 15.0),
                         strength1=1.0, strength2=0.5, bias_y=0.0):
-    """The Fig. 4g flow field. x = cue mode (lick-time invariant),
-    y = ramping mode (lick-time predictive).
+    """Flow field of the two-attractor model (Fig. 4). ``x`` is the cue mode
+    and ``y`` the ramping mode.
 
-    NOTE the field is NORMALISED to unit magnitude, so this is a DIRECTION
-    field, not a gradient flow. The intrinsic slowness between the two basins is
-    therefore largely removed and the timing comes from geometry -- path
-    direction and length -- scaled by the anisotropic gains (30, 10). It is a
-    discrete two-attractor model, not a shallow-basin one.
+    The field is normalised to unit magnitude before anisotropic gains
+    (30, 10) are applied, so it is a direction field rather than a gradient
+    flow; the lick time is set by the path from the initial condition to the
+    lick attractor.
     """
     xs, ys = np.asarray(x) / 5.0, np.asarray(y) / 5.0
     a1x, a1y = a1[0] / 5.0, a1[1] / 5.0
@@ -451,9 +417,9 @@ def two_attractor_field(x, y, *, a1=(1.5, 1.5), a2=(15.0, 15.0),
 def two_attractor_trajectory(amp: float, angle: float, *, dt: float = 1e-3,
                              n_steps: int = 3000, cue_at: float = 0.5,
                              cue_dur: float = 0.2, y_thr: float = 15.0):
-    """One trial. Timing is set ENTIRELY by the initial condition -- the cue
-    kick's amplitude and angle. The flow field is identical on every trial;
-    there is no tonic drive and no trial-history term anywhere in the model."""
+    """Simulate one trial of the two-attractor model. The cue is a transient
+    kick of amplitude ``amp`` and direction ``angle``; the lick time is set by
+    the resulting initial condition. Returns ``(x, y, lick_time)``."""
     x, y = 1.5, 1.5
     xs, ys = np.empty(n_steps), np.empty(n_steps)
     a, b = int(cue_at / dt), int((cue_at + cue_dur) / dt)

@@ -1,10 +1,4 @@
-"""Tests for the supervised face of the timing task.
-
-Kept deliberately small. Open-loop supervised training is retained only as a
-smoke test that the plumbing runs -- it prescribes a target lick time, which the
-main line forbids, and its feedback channels are dead because nothing acts. See
-`claude/timing_task_training_design.md`.
-"""
+"""Tests for the supervised interface to the timing task."""
 import numpy as np
 import pytest
 import torch
@@ -26,7 +20,7 @@ def test_spec_has_a_withhold_unit_and_a_lick_unit():
     t = mk(no_cue_prob=0.0)
     assert t.spec.output_dim == 2 and t.spec.loss == "mse"
     assert t.spec.output_labels == ("withhold", "lick")
-    assert t.dt == pytest.approx(t.cfg.dt * 1000.0), "cognitive.Task works in ms"
+    assert t.dt == pytest.approx(t.cfg.dt * 1000.0), "Task.dt is in milliseconds"
 
 
 def test_batch_shapes():
@@ -40,10 +34,8 @@ def test_batch_shapes():
 
 
 def test_nothing_acts_during_training():
-    """The generator is rolled with a no-lick observer purely to lay out epochs.
-    Every trial therefore runs its full answer window and ends in 'miss'; the
-    outcome is discarded and only the timing is used. This is what removes the
-    teacher whose actions used to decide when trials ended."""
+    """The generator is rolled with a non-licking observer to lay out the
+    epochs, so every trial runs its full answer window and ends in 'miss'."""
     t = mk(no_cue_prob=0.0)
     _, rec = t._roll_trial()
     assert rec["outcome"] == "miss"
@@ -62,10 +54,8 @@ def test_withhold_unit_falls_when_the_delay_elapses():
 
 
 def test_lick_target_keeps_rising_past_the_threshold():
-    """REGRESSION. A target that flattens AT the threshold puts the loss's
-    least-sensitive region on the decision boundary: MSE is indifferent to a 2%
-    undershoot of a plateau while the reward criterion flips on it. Observed
-    accuracy collapsing 1.00 -> 0.24 with the loss flat at 6e-4."""
+    """The lick target equals the threshold at the target time and continues
+    to rise afterwards, up to ``plateau * threshold``."""
     t = mk(no_cue_prob=0.0, plateau=1.5, ramp_exponent=1.0)
     b = t.sample(4)
     for i in range(4):
@@ -98,9 +88,8 @@ def test_cost_mask_is_weighted_not_boolean():
 
 
 def test_catch_trials_hold_withhold_throughout():
-    """Check WITHIN each trial's real length -- the batch is zero-padded to the
-    longest trial, and asserting over the padding is the same mistake that made
-    every model figure include the network's response to post-trial zeros."""
+    """On catch trials the withhold target is held for the whole trial
+    (checked within each trial's own length; the batch is zero-padded)."""
     t = mk(no_cue_prob=1.0)
     b = t.sample(4)
     assert bool(b.meta["no_cue_trial"].all())
@@ -112,8 +101,7 @@ def test_catch_trials_hold_withhold_throughout():
 
 
 def test_variability_sources_are_on():
-    """Degeneracy is the thing to avoid; check the ITI actually varies and input
-    noise is applied."""
+    """The ITI varies across trials and input noise is applied."""
     t = mk(no_cue_prob=0.0, sigma_x=0.05)
     b = t.sample(16)
     assert len(set(b.meta["cue_onset_step"].tolist())) > 4, "ITI must vary"
@@ -142,7 +130,7 @@ def test_crossing_time_and_outcome_split():
 
 
 def test_outcome_counts_reports_engagement_separately():
-    """An agent that never licks scores no errors -- accuracy alone can't see it."""
+    """A silent output has p_engaged 0 and every cued trial counted as a miss."""
     t = mk(no_cue_prob=0.0)
     b = t.sample(6)
     c = t.outcome_counts(torch.zeros_like(b.targets), b)
@@ -161,9 +149,7 @@ def test_weighted_loss_uses_the_weights():
 
 @pytest.mark.slow
 def test_fixed_delay_is_learnable_as_a_smoke_test():
-    """Fixed delay open-loop is DEGENERATE -- every trial is identical, so the
-    network stores one waveform and infers nothing. It trains in a few hundred
-    steps, which is the point: it verifies the plumbing, not the science."""
+    """A fixed-delay task is learnable in a few hundred supervised steps."""
     from timingtask.models import VanillaRNN
     from timingtask.training import train
     torch.manual_seed(0)
@@ -174,4 +160,4 @@ def test_fixed_delay_is_learnable_as_a_smoke_test():
     with torch.no_grad():
         out, H = m(b.inputs)
     assert t.outcome_counts(out, b)["p_engaged"] > 0.8
-    assert H.shape[:2] == b.inputs.shape[:2], "hidden is (B, T, N) = Trajectory.X"
+    assert H.shape[:2] == b.inputs.shape[:2], "hidden is (B, T, N)"

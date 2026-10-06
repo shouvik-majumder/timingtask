@@ -1,33 +1,22 @@
 """
-timingtask.env — the gymnasium face of the timing task.
-====================================================================
+timingtask.env: gymnasium interface to the timing task.
 
-A thin wrapper over :class:`~timingtask.generator.TrialGenerator`.
-All trial logic lives in the generator; this file only adapts it to the
-gymnasium API and fans records out to monitors.
+A thin wrapper over :class:`~timingtask.generator.TrialGenerator`. All trial
+logic lives in the generator; this module adapts it to the gymnasium API and
+forwards trial records to monitors.
 
-EPISODE = SESSION, NOT TRIAL
-----------------------------
-The earlier implementation made one episode one trial, while the delay
-scheduler, the performance tracker and the previous-trial observations were all
-cross-trial state living on the env and surviving ``reset()``. That mismatch was
-the source of most of its complexity, and of a live bug where ``reset(seed=...)``
-silently wiped autolearn progress.
+Episodes
+--------
+An episode is a session of ``trials_per_episode`` trials. ``reset()`` builds a
+fresh generator and scheduler, so no learning progress or trial history
+survives a reset. The task has no terminal state, only a length limit, so
+episode end is reported as ``truncated=True`` and never ``terminated=True``.
 
-Here an episode is a SESSION of ``trials_per_episode`` trials, and ``reset()``
-means "a new animal": a fresh generator, a fresh scheduler, learning progress
-back to zero. Nothing survives a reset, so nothing can be silently destroyed by
-one. The task has no terminal state, only a length limit, so episode end is
-reported as ``truncated=True`` and never ``terminated=True``.
-
-ACTIONS
+Actions
 -------
-``action_mode="discrete"``    Discrete(2), 0 = wait, 1 = lick.
-``action_mode="continuous"``  Box((1,)); a lick is emitted when the signal
-                              crosses ``lick_threshold``. This is the
-                              ramp-to-bound readout of the timing literature and
-                              makes the RL face directly comparable to the
-                              supervised one.
+``action_mode="discrete"``    ``Discrete(2)``: 0 = wait, 1 = lick.
+``action_mode="continuous"``  ``Box((1,))``: a lick is registered when the
+                              signal exceeds ``lick_threshold``.
 """
 from __future__ import annotations
 
@@ -46,7 +35,7 @@ __all__ = ["TimingTaskEnv"]
 
 
 class TimingTaskEnv(gym.Env):
-    """Cue-triggered lick-timing task.
+    """Cue-triggered lick-timing task as a gymnasium environment.
 
     >>> env = TimingTaskEnv(variant="fixed", trials_per_episode=10)
     >>> obs, info = env.reset(seed=0)
@@ -95,7 +84,7 @@ class TimingTaskEnv(gym.Env):
 
     # -- construction -----------------------------------------------------
     def _build(self, seed) -> None:
-        """A fresh animal: new rng, new scheduler, no learning history."""
+        """Create a fresh generator and scheduler."""
         rng = np.random.default_rng(seed)
         self.scheduler = DelayScheduler(self.scheduler_cfg, rng)
         self.gen = TrialGenerator(self.cfg, self.scheduler, self.obs_cfg, rng)
@@ -132,8 +121,7 @@ class TimingTaskEnv(gym.Env):
                 "training_stage": self.scheduler.get_training_stage()}
         if res.record is not None:
             info["record"] = res.record
-        # No terminal state -- only a length limit. Hence truncated, never
-        # terminated; an agent must not bootstrap a zero value at episode end.
+        # No terminal state: episode end is a length limit.
         return res.obs, res.reward, False, bool(truncated), info
 
     def close(self):

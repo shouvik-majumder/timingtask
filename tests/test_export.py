@@ -1,11 +1,4 @@
-"""The seam: what this repository writes, the analysis repository must read.
-
-Two layers of test. The first checks the schema against the written spec using
-h5py alone, so it passes in an environment where only timingtask is installed.
-The second actually opens the file with ``neuralgeom.data.load_trajectory`` and
-is skipped when that package is absent -- it is the only place in this repo
-that mentions it, and it is a test, not the package.
-"""
+"""Tests for the HDF5 export: record conversion and the on-disk schema."""
 import json
 
 import numpy as np
@@ -34,10 +27,7 @@ def make_records(n_gen=4, n_rounds=6, seed=0, delay=0.3, require_cue=True):
             for i in range(n_gen)]
     core = VanillaRNN(gens[0].obs_size, N_UNITS, 1, tau=100.0, dt=cfg.dt * 1000)
     model = ActorCritic(core, n_actions=2)
-    # An UNTRAINED agent licks on about half of all steps, so it restarts the
-    # stop-licking period forever and almost never reaches a cue -- the records
-    # would be nothing but iti_timeout. Bias the policy hard toward waiting so
-    # the fixture exercises the cue-aligned path, which is the default one.
+    # Bias the untrained policy toward waiting so that trials reach the cue.
     with torch.no_grad():
         model.policy.bias[LICK_ACTION] -= 4.0
     recs = []
@@ -85,7 +75,7 @@ def test_bundle_shapes_and_time_base():
 
 
 def test_padding_is_nan_never_zero():
-    """Zero is a perfectly good hidden state; padding must be distinguishable."""
+    """Padding is NaN so that it is distinguishable from a zero hidden state."""
     b = records_to_trajectory(make_records(), t_pre=2.0, t_post=6.0, dt=0.05)
     X = b["X"]
     assert np.isnan(X).any(), "a 8 s window around short trials must have padding"
@@ -102,7 +92,7 @@ def test_n_steps_counts_the_occupied_cells():
 
 
 def test_cue_alignment_puts_cue_onset_at_t_zero():
-    """Under align="cue" the drive should start at the same index every trial."""
+    """Under align="cue" the cue channel turns on at the same index on every trial."""
     recs = make_records()
     b = records_to_trajectory(recs, t_pre=1.0, t_post=3.0, dt=0.05)
     n_pre = int(round(1.0 / 0.05))
@@ -136,7 +126,7 @@ def test_behaviour_survives_into_aux():
                 "outcome_code", "n_steps", "trial_reward"):
         assert key in aux, key
         assert len(aux[key]) == b["X"].shape[0]
-    # None must arrive as NaN, not as a silent zero
+    # None is stored as NaN
     assert np.isnan(aux["first_lick_s"]).any() or np.isfinite(aux["first_lick_s"]).all()
 
 
@@ -165,7 +155,7 @@ def test_hdf5_round_trip_matches_the_documented_schema(tmp_path):
     b = records_to_trajectory(recs, t_pre=1.0, t_post=3.0, dt=0.05)
 
     with h5py.File(path, "r") as f:
-        assert f.attrs["neuralgeom_trajectory"]
+        assert f.attrs["schema"] == "trajectory/1"
         assert np.allclose(f["X"][:], b["X"], equal_nan=True)
         assert np.allclose(f["time"][:], b["time"])
         assert np.isclose(f.attrs["dt"], 0.05)
@@ -186,23 +176,3 @@ def test_connectivity_is_carried_when_given(tmp_path):
     path = save_trajectory(make_records(), str(tmp_path / "w.h5"), W=W)
     with h5py.File(path, "r") as f:
         assert np.allclose(f["W"][:], W)
-
-
-# --------------------------------------------------------------------- #
-# the actual interop, when the analysis package is installed
-# --------------------------------------------------------------------- #
-def test_the_analysis_package_can_load_what_we_write(tmp_path):
-    load_trajectory = pytest.importorskip(
-        "neuralgeom.data", reason="analysis package not installed"
-    ).load_trajectory
-    path = save_trajectory(make_records(), str(tmp_path / "interop.h5"),
-                           t_pre=1.0, t_post=3.0, dt=0.05,
-                           generator="timingtask.rl")
-    traj = load_trajectory(path)
-    assert traj.X.ndim == 3
-    assert traj.time.shape == (traj.X.shape[1],)
-    assert np.isclose(traj.dt, 0.05)
-    assert traj.inputs is not None and traj.outputs is not None
-    assert traj.condition is not None
-    assert traj.meta["generator"] == "timingtask.rl"
-    assert "n_steps" in traj.aux

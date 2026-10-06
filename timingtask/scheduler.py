@@ -1,20 +1,14 @@
 """
-timingtask.scheduler — how the required delay is chosen.
-=====================================================================
+timingtask.scheduler: delay schedules.
 
-Ported from the earlier ``delay_scheduler.py`` with the private methods the
-environment was reaching into promoted to public API.
-
-``cue_autolearn`` reproduces the published training protocol:
-
-    "mice were trained to lick after the cue onset with a minimal delay (0.1 s,
-    'cue association'). Second, the delay duration was gradually increased
-    ('delay training'; reaching criterion performance, 30% rewarded trials in
-    the last 100 trials with a given delay duration, resulted in a delay
-    increase of 0.1 s)"
-
-The defaults in ``SchedulerConfig`` match that protocol parameter for parameter.
-Reference outcome: lick time reaches 1.36 +/- 0.11 s in 6 days (n = 34 mice).
+``cue_autolearn`` implements the two-stage training protocol of the
+behavioural task. In the cue-association stage the delay is held at a minimal
+value until the animal responds reliably to the cue. In the delay-training
+stage the delay increases by ``delay_step`` whenever the rewarded fraction over
+the last ``perf_window`` trials at the current delay exceeds
+``success_threshold``. The defaults in :class:`SchedulerConfig` follow the
+published protocol (0.1 s initial delay, 0.1 s increments, 30% rewarded over
+100 trials).
 """
 from __future__ import annotations
 
@@ -31,6 +25,13 @@ MODES = ("fixed", "autolearn", "cue_autolearn", "block", "manual", "variable")
 
 
 class DelayScheduler:
+    """Chooses the required delay for each trial according to ``config.mode``.
+
+    The generator calls :meth:`on_trial_end` after every trial and reads the
+    delay for the next trial with :meth:`get_current_delay`. Setting
+    ``frozen = True`` holds the delay and the training stage fixed.
+    """
+
     def __init__(self, config: SchedulerConfig,
                  rng: Optional[np.random.Generator] = None):
         if config.mode.lower() not in MODES:
@@ -39,7 +40,7 @@ class DelayScheduler:
         self.rng = rng if rng is not None else np.random.default_rng(0)
         self.reset()
 
-    # -- public attributes the generator reads ----------------------------
+    # -- attributes read by the generator -----------------------------------
     @property
     def min_delay(self) -> float:
         return float(self.config.min_delay)
@@ -62,18 +63,15 @@ class DelayScheduler:
     def get_training_stage(self) -> str:
         return str(self.training_stage)
 
-    # -- promoted from private -------------------------------------------
+    # -- metrics ------------------------------------------------------------
     def cue_success_rate(self) -> Optional[float]:
+        """Fraction of recent cued trials with a lick inside the cue-response
+        window."""
         w = self._cue_success_window
         return float(sum(w) / len(w)) if w else None
 
     def cue_iti_lick_rate(self) -> Optional[float]:
-        """ITI licking in LICKS PER SECOND over the recent window.
-
-        A rate, not the fraction of trials containing a lick: the fraction
-        saturates at 1.0 and stays there while the actual licking falls by an
-        order of magnitude, which is exactly what blocked promotion in the
-        `act` run."""
+        """ITI licking over the recent window, in licks per second."""
         w = self._cue_iti_window
         if not w:
             return None
@@ -82,6 +80,7 @@ class DelayScheduler:
         return float(licks / secs) if secs > 0 else None
 
     def delay_success_rate(self) -> Optional[float]:
+        """Rewarded fraction over the recent window at the current delay."""
         w = self._autolearn_window
         return float(sum(w) / len(w)) if w else None
 
@@ -91,7 +90,7 @@ class DelayScheduler:
                 and self._cue_trials >= max(1, int(c.cue_association_min_trials)))
 
     def status(self) -> Dict[str, Any]:
-        """Everything a monitor wants, in one call."""
+        """Current delay, stage and promotion metrics, for logging."""
         return {"delay": self.get_current_delay(),
                 "training_stage": self.get_training_stage(),
                 "block_index": self.block_index,
@@ -111,7 +110,7 @@ class DelayScheduler:
         self._trials_at_delay = 0
         self._autolearn_window: Deque[int] = deque(maxlen=int(c.perf_window))
         self._cue_success_window: Deque[int] = deque(maxlen=int(c.cue_association_window))
-        # (n_iti_licks, iti_seconds) per trial -- a rate needs both
+        # (n_iti_licks, iti_seconds) per trial
         self._cue_iti_window: Deque[Any] = deque(maxlen=int(c.cue_association_window))
         self._cue_trials = 0
         self._block_index = 0
@@ -135,14 +134,8 @@ class DelayScheduler:
             self.current_delay = self._sample_variable_delay()
 
     def _sample_variable_delay(self) -> float:
-        """A fresh delay every trial.
-
-        This is what stops the supervised task being degenerate: with one fixed
-        interval the network stores a single waveform and infers nothing. With
-        the delay varying, and NOT signalled by any input, the network can at
-        best learn the distribution -- which is the honest version of what the
-        animal faces, since it is never told the criterion either.
-        """
+        """A new delay on every trial, from ``delay_set`` or uniformly from
+        ``[min_delay, max_delay]``."""
         c = self.config
         if c.delay_set:
             return float(c.delay_set[int(self.rng.integers(0, len(c.delay_set)))])
@@ -194,15 +187,13 @@ class DelayScheduler:
 
     def on_trial_end(self, success: Optional[bool],
                      record: Optional[Dict[str, Any]] = None) -> float:
+        """Update the schedule after a trial. ``success`` is None for trials
+        that are not scored (catch trials, ITI timeouts). Returns the delay
+        for the next trial."""
         c = self.config
         rec = record or {}
         self.trial_count += 1
         self.last_stage_transition = False
-        # Frozen: hold the delay and the stage exactly where they are. Used to
-        # evaluate a trained agent at ONE delay -- a raster taken while the
-        # curriculum is still moving mixes several tasks in one picture.
-        # A flag rather than a mode switch because all 16 environments share one
-        # SchedulerConfig object but each is at its own delay.
         if getattr(self, "frozen", False):
             return float(self.current_delay)
         mode = c.mode.lower()

@@ -1,30 +1,31 @@
 """
-timingtask — the cue-triggered lick-timing task, its agents, and their training.
-================================================================================
+timingtask: a cue-triggered lick-timing task for recurrent agents.
 
-A self-contained research package: generate trials, train agents on them by
-whatever method, and export what the agent did and what its units did.
+The package provides the trial generator, a gymnasium environment, a batched
+supervised interface, recurrent network models, reinforcement-learning and
+supervised trainers, and an HDF5 exporter for trained-agent states and
+behaviour.
 
-    config.py      three dataclasses; every number, no logic
-    generator.py   the trial state machine (timer and cue as INDEPENDENT axes)
-    scheduler.py   the delay curriculum
-    monitor.py     JSONL / in-memory trial logging
-    env.py         gymnasium wrapper          (gymnasium is an optional extra)
-    models.py      the agent zoo — recurrent cores behind one ``step`` interface
-    contract.py    TaskSpec / TrialBatch / Task, the batched-trial interface
-    rl.py          REINFORCE with a learned baseline; ActorCritic
-    training.py    the task-agnostic supervised trainer
-    supervised.py  the task as a batched, supervised ``Task``
-    variants.py    named configurations + the CLI
-    plots.py       the diagnostic figures
-    circuits.py    the two published timing models, re-derived numerically
-    export.py      write states + behaviour as a Trajectory HDF5 file
+Modules
+-------
+config       Configuration dataclasses for the task, the delay schedule and
+             the observation vector.
+generator    The trial state machine.
+scheduler    Delay schedules, including the two-stage training curriculum.
+monitor      Per-trial record logging (in memory or JSONL).
+env          gymnasium ``Env`` wrapper (requires the ``gym`` extra).
+models       Recurrent network models sharing one ``step`` interface.
+contract     ``TaskSpec`` / ``TrialBatch`` / ``Task``, the batched-trial API.
+rl           Actor-critic agent and REINFORCE trainer.
+training     Task-agnostic supervised trainer.
+supervised   The task as a batched supervised ``Task``.
+variants     Named configurations and the command-line interface.
+plots        Behavioural and network diagnostics (requires the ``plots`` extra).
+circuits     Published low-dimensional timing circuits, for reference.
+export       HDF5 export of hidden states, inputs, readouts and behaviour.
 
-This package depends on nothing but numpy / torch / h5py (and, lazily,
-matplotlib, scikit-learn, gymnasium). In particular it does NOT import the
-geometry library. The two meet at a FILE, not an import: ``export.py`` writes
-the ``Trajectory`` HDF5 schema, and the geometry side reads it with
-``neuralgeom.data.load_trajectory``. Train here; analyse there.
+Core dependencies are numpy, torch and h5py. gymnasium, matplotlib and
+scikit-learn are optional and imported lazily.
 """
 from .config import (ObservationConfig, SchedulerConfig, TimingTaskConfig,
                      VARIANTS, make_config)
@@ -36,7 +37,7 @@ from .contract import Task, TaskSpec, TrialBatch
 from .models import GRUModel, LSTMModel, MODELS, VanillaRNN, make_model
 from .export import records_to_trajectory, save_trajectory
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["TimingTaskConfig", "SchedulerConfig", "ObservationConfig",
            "VARIANTS", "make_config", "TrialGenerator", "StepResult", "Phase",
@@ -49,8 +50,7 @@ __all__ = ["TimingTaskConfig", "SchedulerConfig", "ObservationConfig",
 
 
 def __getattr__(name):
-    # gymnasium is an optional extra; importing the env should only fail for
-    # someone who actually asks for it.
+    # gymnasium is an optional dependency; defer the import until requested.
     if name == "TimingTaskEnv":
         from .env import TimingTaskEnv
         return TimingTaskEnv

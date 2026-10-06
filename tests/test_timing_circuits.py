@@ -1,8 +1,5 @@
-"""Tests for the published candidate circuits.
-
-Every number here is re-derived from the released connectivity matrices, not
-copied from the papers -- the published Methods contain no equations.
-"""
+"""Tests for the reference circuits. Expected values are derived from the
+released connectivity matrices."""
 import numpy as np
 import pytest
 from timingtask import circuits as C
@@ -14,8 +11,7 @@ def test_verify_passes():
 
 
 def test_accepted_model_is_a_perfect_integrator():
-    """Exactly one zero Jacobian eigenvalue -- a 1-D line attractor. Not a point
-    attractor, not a saddle."""
+    """Exactly one zero Jacobian eigenvalue: a one-dimensional line attractor."""
     s = C.classify("data")
     assert s.n_zero == 1
     ev = np.sort(np.abs(s.eig_J))
@@ -31,9 +27,8 @@ def test_integrated_variable_is_the_striatal_difference_mode():
 
 
 def test_alm_is_off_manifold_and_striatum_is_on():
-    """The paper's core claim, checkable in three lines: the ALM common drive
-    contributes nothing to the time representation while striatal input is
-    integrated. This asymmetry is why one protocol pauses and the other rewinds."""
+    """The cortical silencing direction is orthogonal to the integration
+    manifold; the striatal inhibition direction is not."""
     s = C.classify("data")
     assert abs(s.overlaps["ALM silencing"]) < 0.05
     assert abs(s.overlaps["STR inhibition"]) > 0.5
@@ -54,9 +49,8 @@ def test_dynamical_classes_of_every_model():
 
 
 def test_alm_integrator_model_cannot_be_touched_by_striatum():
-    """ED1d's left eigenvector has EXACTLY zero striatal weight, so striatal
-    inhibition cannot affect the timer. That null prediction is what the data
-    falsify."""
+    """In the cortical-integrator model the left eigenvector has zero
+    striatal weight, so striatal inhibition cannot affect the timer."""
     s = C.classify("one_integrator_follower_opposite")
     assert abs(s.left[2]) < 1e-9 and abs(s.left[3]) < 1e-9
     assert abs(s.overlaps["STR inhibition"]) < 1e-9
@@ -69,8 +63,7 @@ def test_leaky_model_has_a_one_second_leak():
 
 
 def test_control_lick_times_reproduce_the_released_model():
-    """Ramp slope is set by the tonic input amplitude, and the five conditions
-    span 0.9-2.1 s."""
+    """Control lick times of the accepted model match the released simulation."""
     p = C.perturbation_signature("data")
     lt = np.array(p["control_lick_times"])
     assert np.allclose(lt, [0.901, 1.142, 1.455, 1.735, 2.078], atol=0.01)
@@ -78,8 +71,8 @@ def test_control_lick_times_reproduce_the_released_model():
 
 
 def test_ramp_slope_is_exactly_linear_in_the_input():
-    """A perfect integrator must have slope proportional to input amplitude.
-    This is the property a trained network either has or does not."""
+    """In a perfect integrator the ramp slope is proportional to the input
+    amplitude."""
     c = C.get("data")
     ratios = []
     for gain in c.trial_gains:
@@ -91,10 +84,9 @@ def test_ramp_slope_is_exactly_linear_in_the_input():
 
 
 def test_the_accepted_model_pauses_then_rewinds():
-    """The discriminating signature. ALM silencing shifts the lick time by about
-    the silencing duration regardless of trial length (state-independent);
-    striatal inhibition sets the state back by a constant amplitude, so the
-    shift grows with trial duration (state-dependent)."""
+    """Cortical silencing produces a state-independent shift of about the
+    silencing duration; striatal inhibition produces a shift that grows with
+    trial duration."""
     p = C.perturbation_signature("data")
     assert "PAUSE" in p["alm"]["signature"]
     assert abs(p["alm"]["slope"]) < 0.15
@@ -104,7 +96,8 @@ def test_the_accepted_model_pauses_then_rewinds():
 
 
 def test_no_other_model_produces_that_pair():
-    """The paper's argument, reproduced from the matrices."""
+    """Only the accepted model shows a pause under cortical silencing and a
+    rewind under striatal inhibition."""
     ok = []
     for name in C.MODELS:
         p = C.perturbation_signature(name)
@@ -114,7 +107,7 @@ def test_no_other_model_produces_that_pair():
 
 
 def test_externally_driven_model_snaps_back():
-    """No slow mode at all: a perturbation leaves no trace once it ends."""
+    """The externally driven model has no slow mode."""
     s = C.classify("externally_driven")
     assert s.n_zero == 0 and s.n_near_zero == 0
     assert "NO SLOW MODE" in s.classification
@@ -133,8 +126,7 @@ def test_panel_letters_resolve():
 
 # --------------------------------------------------- Majumder two-attractor
 def test_two_attractor_timing_is_set_by_the_cue_kick():
-    """The flow field is identical on every trial; a larger kick licks earlier.
-    No tonic drive and no trial-history term anywhere in that model."""
+    """A larger cue kick produces an earlier lick."""
     lts = [C.two_attractor_trajectory(a, np.pi / 4)[2]
            for a in (150, 127.5, 105, 82.5)]
     fin = [x for x in lts if np.isfinite(x)]
@@ -143,9 +135,8 @@ def test_two_attractor_timing_is_set_by_the_cue_kick():
 
 
 def test_two_attractor_field_has_a_separatrix_between_the_basins():
-    """Two basins, so the flow reverses somewhere between them. It does, near
-    the midpoint: at (3,3) the field points back to baseline, at (12,12) on to
-    the lick state."""
+    """The flow points back to baseline inside the baseline basin and toward
+    the lick state inside the lick basin."""
     u_lo, v_lo = C.two_attractor_field(3.0, 3.0)
     u_hi, v_hi = C.two_attractor_field(12.0, 12.0)
     assert u_lo < 0 and v_lo < 0, "inside the baseline basin, flow returns"
@@ -153,11 +144,8 @@ def test_two_attractor_field_has_a_separatrix_between_the_basins():
 
 
 def test_the_field_is_normalised_not_a_gradient_flow():
-    """Implementation detail that changes the interpretation: the field is
-    divided by its own magnitude before the anisotropic gains (30, 10) are
-    applied. The intrinsic slowness between basins is therefore largely removed
-    and the timing comes from geometry -- path direction and length -- so this
-    is a discrete two-attractor model, not a shallow-basin one."""
+    """The field is normalised to unit magnitude before the anisotropic gains
+    (30, 10) are applied."""
     for pt in [(3.0, 3.0), (8.0, 8.0), (12.0, 12.0), (14.0, 14.0)]:
         u, v = C.two_attractor_field(*pt)
         assert np.hypot(u / 30.0, v / 10.0) == pytest.approx(1.0, abs=1e-3), pt

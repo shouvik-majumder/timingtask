@@ -1,13 +1,11 @@
 """
-timingtask.config — configuration for the cue-triggered timing task.
-================================================================================
+timingtask.config: configuration for the cue-triggered lick-timing task.
 
-Three dataclasses, no logic. Values here are conveniences; the trial *logic*
-lives in ``generator.py`` and does not depend on any particular number.
+Three dataclasses hold every numerical setting. Trial logic lives in
+``generator.py`` and does not depend on any particular value.
 
-Times are in SECONDS throughout. ``TimingTaskConfig.dt`` converts to the integer
-step counts the generator actually runs on -- float time accumulated by repeated
-subtraction drifts, and phase boundaries then land a step early or late.
+All durations are in seconds. ``TimingTaskConfig.steps`` converts a duration to
+the integer step count the generator operates on.
 """
 from __future__ import annotations
 
@@ -22,103 +20,70 @@ __all__ = ["TimingTaskConfig", "SchedulerConfig", "ObservationConfig",
 class TimingTaskConfig:
     """Trial structure and reinforcement.
 
-    The task: the animal must withhold licking for the whole stop-licking
-    period or it restarts; a cue then starts a timer; a lick before the delay
-    elapses aborts the trial unrewarded; a lick anywhere in the answer window is
-    rewarded (binary).
+    A trial consists of a stop-licking period of random duration, a cue that
+    starts a timer, a required delay measured from cue onset, and an answer
+    window. A lick before the delay elapses ends the trial unrewarded; the
+    first lick inside the answer window is rewarded.
     """
 
     dt: float = 0.02
 
     # --- cue -------------------------------------------------------------
-    # The cue is an OBSERVABLE SIGNAL, not a phase. It is high for this long
-    # from cue onset and overlaps the timer arbitrarily. If the delay is shorter
-    # than the cue, a lick after the delay but while the cue is still on IS
-    # rewarded. Nothing downstream may assume a cue duration.
+    # The cue is an observable input signal, independent of the trial phase.
+    # It is high for ``cue_duration`` from cue onset and may outlast the delay,
+    # in which case a lick after the delay but during the cue is rewarded.
     cue_duration: float = 0.6
 
-    # How the cue reaches the network.
-    #
-    #   "pulse" -- one channel, high for `cue_duration` from cue onset. This was
-    #              the only option, and with tau = 100 ms nothing of it survives
-    #              into the part of the trial where the delay has to be timed:
-    #              a pulse into a leaky unit leaves a transient that is gone in
-    #              ~100 ms, so the network free-runs with no input at all.
-    #   "step"  -- one channel, high from cue onset until the trial ends. In a
-    #              near-integrator a step produces a RAMP, which is the thing a
-    #              threshold crossing can time. A constant step carries no
-    #              elapsed-time information by itself; its integral does.
-    #   "both"  -- two channels, the transient AND the tonic step. This is what
-    #              Yang et al. actually use: the transient cue enters ALM unit 1
-    #              OFF the integration manifold, while a tonic step held from
-    #              cue onset drives the integrator, and the step's AMPLITUDE is
-    #              their timing knob (slope/amplitude = 4.035, exactly linear).
-    #              Here the amplitude is fixed at 1 and the network sets its own
-    #              gain through W_in.
-    #
-    # Catch trials stay at zero on every cue channel, so the zero-input control
-    # is unchanged.
+    # How the cue is presented to the agent.
+    #   "pulse"  one channel, high for ``cue_duration`` from cue onset.
+    #   "step"   one channel, high from cue onset until the trial ends.
+    #   "both"   two channels: the transient pulse and the tonic step.
+    # Catch trials hold every cue channel at zero.
     cue_mode: str = "pulse"
 
-    # --- the timer -------------------------------------------------------
-    answer_window: float = 5.0        # 3 s autolearn / 5 s fixed / 10 s switching
-    post_lick: float = 1.5            # trial continues after the first lick so
-                                      # peri_lick and post_lick epochs exist
-    lick_refractory: float = 0.05     # minimum gap between licks in a bout
+    # --- timer -----------------------------------------------------------
+    answer_window: float = 5.0        # seconds after the delay in which a lick is rewarded
+    post_lick: float = 1.5            # trial continues this long after the decisive lick
+    lick_refractory: float = 0.05     # minimum interval between accepted licks
 
     # --- stop-licking period (ITI) ---------------------------------------
-    # Resampled from a truncated exponential every trial so cue onset is
-    # unpredictable. ANY lick restarts it.
+    # Drawn from a truncated exponential on every trial, so that cue onset is
+    # unpredictable from trial start.
     iti_mean: float = 1.2
     iti_min: float = 0.5
     iti_max: float = 2.5
-    iti_timeout: float = 20.0         # give up on a trial stuck in ITI
+    iti_timeout: float = 20.0         # abandon a trial that has not left the ITI
 
-    # If False the stop-licking period runs to completion regardless of licking.
-    # The restart rule is what makes an agent that licks freely almost never
-    # reach a cue -- so it cannot experience cue->reward, and cannot learn the
-    # association it needs in order to stop licking for the right reason.
-    # Turning it off breaks that trap at the cost of task fidelity.
+    # If True, any lick during the stop-licking period resamples its duration.
+    # If False, the period runs to completion regardless of licking.
     iti_restart_on_lick: bool = True
 
-    no_cue_prob: float = 0.1          # catch trials: the zero-input control
+    no_cue_prob: float = 0.1          # fraction of catch trials (no cue, no timer)
 
     # --- reinforcement ---------------------------------------------------
-    reward: float = 10.0              # binary; paid on the first eligible lick
+    reward: float = 10.0              # paid on the first lick inside the answer window
     early_penalty: float = -1.0       # lick before the delay elapses
-    miss_penalty: float = -2.0        # answer window expired with no lick
-    iti_lick_penalty: float = -0.1    # lick during the stop-licking period
-    no_cue_lick_penalty: float = -0.1
+    miss_penalty: float = -2.0        # answer window expires with no lick
+    iti_lick_penalty: float = -0.1    # each accepted lick in the stop-licking period
+    no_cue_lick_penalty: float = -0.1 # each accepted lick on a catch trial
     iti_timeout_penalty: float = -10.0
-    time_penalty: float = -0.05       # per STEP, while the trial runs
+    time_penalty: float = -0.05       # per step while the trial runs
 
-    # Does the per-step cost apply during the post-lick wind-down?
-    # It used to, and that was a perverse incentive: the wind-down is 1.5 s of
-    # steps that follow a decisive lick and carry no contingency, so licking
-    # cost 3.75 more than NOT licking at the same moment -- the task paid the
-    # agent to miss. False charges only the phases where an action still
-    # matters.
+    # Whether the per-step cost also applies during the post-lick period, in
+    # which no action has any consequence.
     time_penalty_in_post: bool = False
 
-    # --- subjective value: an ACROSS-TRIAL gain on reward and on the cost of
-    # --- a wasted opportunity ----------------------------------------------
-    # A run of failures should make water matter more and make throwing a trial
-    # away hurt more; a run of successes should make both matter less. One
-    # scalar does both, because they are the same quantity -- what this trial's
-    # outcome is worth right now.
+    # --- across-trial value gain -------------------------------------------
+    # A multiplicative gain on the reward and on the early-lick penalty that
+    # depends on the recent reward rate:
     #
-    #   rate = rewarded fraction over the last `reward_rate_window` trials
+    #   rate = rewarded fraction over the last ``reward_rate_window`` trials
     #   gain = clip(exp(reward_rate_gain * (reward_rate_ref - rate)),
     #               reward_rate_min, reward_rate_max)
-    #   water paid       = reward       * gain
-    #   early lick costs = early_penalty * gain
     #
-    # Per environment, and NOT observable: the animal feels the value of water
-    # change but is never told the number, so the agent has to infer it from
-    # its own outcome history through the previous-trial channels.
-    #
-    # reward_rate_gain = 0 disables it. At 1.0 with ref 0.5 the gain runs from
-    # 1.65 after a run of failures to 0.61 after a run of successes.
+    # The gain is computed per environment and is not observable; it reaches
+    # the agent only through the magnitude of the rewards it receives.
+    # ``reward_rate_gain = 0`` disables it.
     reward_rate_gain: float = 0.0
     reward_rate_window: int = 100
     reward_rate_ref: float = 0.5
@@ -126,84 +91,82 @@ class TimingTaskConfig:
     reward_rate_max: float = 2.0
 
     # Exponential discount on the reward: reward * exp(-rate * lick_time).
-    # Off by default -- it shapes WHEN the agent licks, which is the dependent
-    # variable, so it is an explicit manipulation and never a silent default.
+    # 0 disables it.
     discount_rate: float = 0.0
 
     seed: Optional[int] = 0
 
     # --- derived ---------------------------------------------------------
     def steps(self, seconds: float) -> int:
+        """Convert a duration in seconds to an integer number of steps."""
         return int(round(float(seconds) / float(self.dt)))
 
 
 @dataclass
 class SchedulerConfig:
-    """How the required delay is chosen, trial to trial.
+    """How the required delay is chosen from trial to trial.
 
-    ``cue_autolearn`` reproduces the published protocol: a cue-association stage
-    at a minimal delay, promoted to delay-growing autolearn once the animal
-    responds to the cue and stops licking in the ITI.
+    ``cue_autolearn`` implements the two-stage training protocol of the
+    behavioural task: a cue-association stage at a minimal delay, followed by
+    delay training in which the delay increases by ``delay_step`` whenever the
+    rewarded fraction over a window of recent trials exceeds a criterion.
     """
 
     mode: str = "fixed"      # fixed | variable | autolearn | cue_autolearn | block | manual
 
     fixed_delay: float = 0.6
-    initial_delay: float = 0.1        # autolearn starts at the cue-association delay
+    initial_delay: float = 0.1
     delay_step: float = 0.1
     min_delay: float = 0.1
     max_delay: float = 2.0
 
-    # autolearn: 30% rewarded in the last 100 trials at a given delay -> +0.1 s
+    # autolearn promotion: rewarded fraction over ``perf_window`` trials at the
+    # current delay must exceed ``success_threshold``.
     perf_window: int = 100
     min_trials_per_delay: int = 100
     success_threshold: float = 0.30
 
-    # cue association: promote on cue-response rate AND low ITI licking
+    # cue association: promotion requires a cue-response rate above threshold
+    # and, optionally, an ITI lick rate below a ceiling.
     cue_association_delay: float = 0.1
     cue_association_window: int = 100
     cue_association_min_trials: int = 100
     cue_association_response_window: float = 0.6
     cue_association_success_threshold: float = 0.50
-    # Promotion out of cue association used to require the FRACTION OF TRIALS
-    # containing at least one ITI lick to fall below a threshold. That number
-    # cannot distinguish 55 ITI licks per trial from 6, so it stayed at 1.00
-    # through the entire learning curve of the `act` run and blocked a agent
-    # that had reached 0.84 cue success. It is now a RATE in licks per second,
-    # and None disables the criterion entirely -- which is the default, since
-    # the ITI restart rule it was paired with is also off.
+    # ITI lick-rate ceiling in licks per second. None disables the criterion.
     cue_association_max_iti_lick_hz: Optional[float] = None
 
-    # VARIABLE: a fresh delay every trial. Empty set -> uniform(min, max).
+    # variable: a new delay on every trial, drawn from ``delay_set`` or, if
+    # empty, uniformly from [min_delay, max_delay].
     delay_set: List[float] = field(default_factory=list)
 
+    # block: delays held constant for a random number of trials per block.
     block_delays: List[float] = field(default_factory=lambda: [1.0, 3.0])
     block_min_trials: int = 50
     block_max_trials: int = 150
 
+    # manual: an explicit per-trial delay sequence (the last value is held).
     manual_schedule: Optional[List[float]] = None
 
 
 @dataclass
 class ObservationConfig:
-    """What the agent sees. The cue channel is always present.
+    """Composition of the observation vector.
 
-    The previous-trial channels are what let the agent modulate its timing by
-    experience. They are held CONSTANT for the whole trial -- a static offset,
-    not an event -- so the agent can use them to set a ramp slope from the first
-    step. ``n_lags`` extends this to the last K trials; with the history carried
-    explicitly in the input, the recurrent state does not have to bridge trials
-    and an episode can be a single trial.
+    The cue channel(s) are always present. The previous-trial channels report
+    the outcome of the preceding trial(s) and are held constant for the whole
+    of the current trial. ``n_lags`` sets how many previous trials are
+    reported.
     """
 
     include_prev_reward: bool = True
     include_prev_action: bool = True
     include_prev_trial_success: bool = True
     include_prev_first_lick: bool = True
-    n_lags: int = 1                   # how many previous trials to expose
+    n_lags: int = 1
     include_trial_start: bool = False
     include_block_context: bool = False
-    include_normalized_delay: bool = False   # leaks the answer; off by default
+    include_normalized_delay: bool = False   # reveals the required delay; off by default
 
     @property
     def per_lag(self) -> int:
@@ -213,7 +176,8 @@ class ObservationConfig:
                                     self.include_prev_first_lick))
 
 
-# Experiment variants. Only durations differ -- the logic is identical.
+# Named task variants. They differ only in the answer window and the delay
+# schedule; the trial logic is identical.
 VARIANTS = {
     "autolearn": dict(answer_window=3.0, mode="cue_autolearn"),
     "fixed":     dict(answer_window=5.0, mode="fixed"),
@@ -222,7 +186,10 @@ VARIANTS = {
 
 
 def make_config(variant: str = "fixed", **overrides):
-    """Return ``(TimingTaskConfig, SchedulerConfig)`` for a named variant."""
+    """Return ``(TimingTaskConfig, SchedulerConfig)`` for a named variant.
+
+    Keyword overrides are applied to whichever dataclass defines the field.
+    """
     if variant not in VARIANTS:
         raise KeyError(f"Unknown variant {variant!r}. Available: {sorted(VARIANTS)}")
     v = dict(VARIANTS[variant])

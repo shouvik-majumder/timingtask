@@ -11,8 +11,7 @@ dist/
 .venv/
 venv/
 
-# Data (never committed; *.csv is not ignored so small parameter tables can be versioned)
-SampleData/
+# Data and model files
 /data/
 *.h5
 *.hdf5
@@ -28,15 +27,20 @@ SampleData/
 *.parquet
 *.feather
 
-# Generated artefacts
+# Generated outputs
 outputs/
 runs/
 
-# Machine-local configuration and working notes
-data_dir.local
-config.local.*
+# LaTeX build files
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.synctex.gz
+
+# Machine-local configuration
+*.local
 .env
-current-focus.md
 
 # Editors and OS
 .vscode/

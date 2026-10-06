@@ -1,67 +1,41 @@
 """
-timingtask.supervised — the supervised face of the timing task.
-============================================================================
+timingtask.supervised: the timing task as a batched supervised ``Task``.
 
-Wraps the trial generator in the ``Task`` interface from
-:mod:`timingtask.contract`, so ``training.train`` and
-``models.make_model`` work unchanged::
+Wraps the trial generator in the :class:`~timingtask.contract.Task` interface
+so that :func:`timingtask.training.train` and
+:func:`timingtask.models.make_model` apply directly::
 
     task  = TimingTask(variant="fixed")
     model = make_model("vanilla", task.spec, hidden_size=256, dt=task.dt)
     train(model, task, steps=4000)
 
-THE NETWORK NEVER ACTS DURING TRAINING, AND NOTHING SCRIPTED DOES EITHER
------------------------------------------------------------------------
-An earlier version rolled a scripted "perfect" licker through the environment
-and trained on the trials it produced. That is behavioural cloning of a teacher,
-and worse, it let the teacher's action decide when each trial ENDED -- so the
-network only ever saw trial structure shaped by another agent's behaviour.
+Trial layout
+------------
+Following the convention of Yang et al. (2019) and related work, each trial
+has a fixed epoch structure and nothing acts during training. The generator
+is rolled forward with a non-licking observer to lay out the epochs (ITI, cue,
+delay, answer window), and every trial runs to the end of its answer window.
 
-The convention in this literature (Yang et al. 2019; Wang et al. 2018; Sohn et
-al. 2019; Dubreuil/Valente et al. 2022) is different and simpler: a trial has a
-FIXED EPOCH STRUCTURE, nothing acts during training, and the network's output is
-scored against a target defined over the whole window. Here that means the
-generator is rolled forward with a no-lick observer purely to lay out the
-epochs -- ITI, cue, delay, answer window -- and every trial runs to the end of
-its answer window regardless of what any agent would have done.
+Outputs
+-------
+Two output units:
 
-OUTPUTS: A WITHHOLD UNIT AND A LICK UNIT
-----------------------------------------
-Two outputs, following the fixation/response convention of Yang et al. 2019:
+    unit 0  WITHHOLD   high while licking is not permitted, low afterwards
+    unit 1  LICK       ramps from cue onset and crosses ``threshold`` at the
+                       target time
 
-    unit 0  WITHHOLD   high while the animal must not lick, low afterwards
-    unit 1  LICK       rises to threshold across the answer window
-
-A single ramp cannot express "actively hold still" -- it only says "not yet".
-The two-unit form gives the withhold requirement its own gradient, which matters
-here because the task asks the network to withhold twice for different reasons
-(the ITI, and then the delay).
-
-COST MASK
+Cost mask
 ---------
-Weighted, not boolean, following ``multitask/task.py::add_c_mask``:
+The per-step loss weight is zero during a grace period at trial start and
+around each epoch transition, ``w_answer`` inside the answer window and 1
+elsewhere. The withhold unit is additionally weighted by ``w_withhold``.
 
-  * a GRACE PERIOD at trial start and straddling each epoch transition, weight 0,
-    so the network is not punished for finite response latency;
-  * the answer window up-weighted (``w_answer``, default 5);
-  * the withhold unit up-weighted (``w_withhold``, default 2), because a task
-    whose main difficulty is not-responding needs the not-responding scored.
-
-VARIABILITY
------------
-Degeneracy is the thing to avoid: if every trial is identical the network stores
-one waveform and infers nothing. Sources here, all on by default:
-
-  * variable ITI (truncated exponential -> flat hazard, so elapsed time carries
-    no information about cue onset and the network must time FROM THE CUE);
-  * catch trials, where the target holds withhold for the whole trial;
-  * input noise ``sigma_x`` and recurrent noise (in the model), both scaled by
-    sqrt(2/alpha) so their effect is dt-independent;
-  * optional jitter on the target lick time.
-
-Trial-to-trial variation of the required delay comes from the scheduler
-(``mode="variable"``), which is what turns this from "reproduce one waveform"
-into "read the interval off experience".
+Trial-to-trial variability
+--------------------------
+The ITI duration varies (truncated exponential), catch trials hold the
+withhold target throughout, input and recurrent noise are scaled to be
+dt-independent, and the target lick time may be jittered. Variation of the
+required delay across trials comes from the scheduler (``mode="variable"``).
 """
 from __future__ import annotations
 
@@ -86,25 +60,18 @@ class TimingTask(Task):
 
     Parameters
     ----------
-    target_offset : where in the answer window supervision aims, in seconds
-        after the delay elapses.
-    target_jitter : SD of per-trial jitter on that aim point (seconds). Small
-        jitter stops the network locking onto one exact step. Note this is an
-        augmentation, not a published technique -- Sohn et al. jitter the INPUT
-        event times instead, which is the more defensible route when the point
-        is scalar timing noise.
-    threshold : level the lick unit must cross; the lick time is the crossing.
-    plateau : where the lick target settles after the crossing, as a multiple of
-        ``threshold``. Must be > 1 -- a target that flattens AT the threshold
-        puts the loss's least-sensitive region on the decision boundary, and the
-        network's accuracy then collapses while its loss keeps improving.
-    hold_level : the withhold unit's target while withholding.
+    target_offset : target lick time, in seconds after the delay elapses.
+    target_jitter : SD of per-trial Gaussian jitter on the target time (s).
+    threshold : level the lick unit must cross; the crossing is the lick time.
+    plateau : level the lick target settles at after the crossing, as a
+        multiple of ``threshold``. Must exceed 1 so that the target continues
+        to rise through the threshold.
+    hold_level : target of the withhold unit while withholding.
     w_answer, w_withhold : cost-mask weights.
-    grace : seconds of zero weight after trial start and after each transition.
-    sigma_x : input noise SD, scaled by sqrt(2/alpha) like the recurrent noise.
-    eval_noise : if True, input noise is applied even when the model is in eval
-        mode. Without it every trial is identical and there is no lick-time
-        DISTRIBUTION to compare with an animal's.
+    grace : seconds of zero loss weight after trial start and after each
+        epoch transition.
+    sigma_x : input noise SD.
+    eval_noise : apply input noise in eval mode as well as training mode.
     """
 
     def __init__(self,
@@ -131,11 +98,10 @@ class TimingTask(Task):
             task_config, scheduler_config = make_config(variant)
         cfg = task_config or TimingTaskConfig()
         if plateau <= 1.0:
-            raise ValueError(
-                "plateau must be > 1: a target that flattens at the threshold "
-                "puts the loss's least-sensitive region on the decision boundary")
+            raise ValueError("plateau must be > 1 so that the lick target "
+                             "continues to rise through the threshold")
 
-        # cognitive.Task works in MILLISECONDS; the timing configs use seconds.
+        # Task works in milliseconds; the configuration dataclasses use seconds.
         super().__init__(dt=cfg.dt * 1000.0, sigma=sigma_x, seed=seed)
 
         self.cfg = cfg
@@ -168,12 +134,10 @@ class TimingTask(Task):
 
     # -- rollout ----------------------------------------------------------
     def _roll_trial(self) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Lay out ONE trial's epochs with a no-lick observer.
+        """Lay out one trial's epochs with a non-licking observer.
 
-        Nothing acts. The observer never licks, so the trial runs its full
-        course -- ITI, cue, delay, the whole answer window -- and the resulting
-        structure is a property of the task, not of any agent's behaviour.
-        The 'miss' outcome this produces is discarded; only the timing is used.
+        The trial runs its full course (ITI, cue, delay, answer window). The
+        resulting ``miss`` outcome is discarded; only the epoch timing is used.
         """
         obs: List[np.ndarray] = []
         for _ in range(200000):
@@ -185,17 +149,17 @@ class TimingTask(Task):
 
     def _target_and_mask(self, n_steps: int, rec: Dict[str, Any]
                          ) -> Tuple[np.ndarray, np.ndarray]:
-        """Return ``(y (T, 2), w (T,))`` -- targets and cost-mask weights."""
+        """Return ``(y (T, 2), w (T,))``: targets and cost-mask weights."""
         dt = self.cfg.dt
         y = np.zeros((n_steps, 2), dtype=np.float32)
         w = np.zeros(n_steps, dtype=np.float32)
         grace_steps = max(1, int(round(self.grace / dt)))
         onset = rec.get("cue_onset_step")
 
-        # WITHHOLD is high from trial start; it only falls once licking is allowed.
+        # WITHHOLD is high from trial start and falls once licking is permitted.
         y[:, WITHHOLD] = self.hold_level
         w[:] = 1.0
-        w[:grace_steps] = 0.0                    # settle-in at trial start
+        w[:grace_steps] = 0.0
 
         if onset is None:                        # catch trial: withhold throughout
             return y, w
@@ -207,19 +171,18 @@ class TimingTask(Task):
         idx = np.arange(n_steps)
         elapsed = idx - onset
 
-        # LICK unit: rises from cue onset, crosses `threshold` at t*, keeps
-        # rising to `plateau * threshold` -- it must NOT flatten at the threshold.
+        # LICK rises from cue onset, crosses ``threshold`` at t*, and continues
+        # to ``plateau * threshold``.
         rising = elapsed >= 0
         frac = np.maximum(elapsed[rising], 0) / star
         y[rising, LICK] = np.minimum(
             self.threshold * frac ** self.ramp_exponent,
             self.threshold * self.plateau)
-        # WITHHOLD falls once the delay has elapsed.
         delay_step = int(round(float(rec["delay"]) / dt))
         y[elapsed >= delay_step, WITHHOLD] = 0.05
 
-        # weights: answer window matters most; grace windows straddle each
-        # transition so response latency is never punished.
+        # Weights: the answer window is up-weighted; grace windows around each
+        # transition carry zero weight.
         w[elapsed >= delay_step] = self.w_answer
         for edge in (0, delay_step, star):
             m = (elapsed >= edge - grace_steps // 2) & (elapsed < edge + grace_steps)
@@ -261,14 +224,13 @@ class TimingTask(Task):
             "answer_window": col("answer_window"),
             "weight": weight,                    # the cost mask, as weights
         }
-        # loss_mask stays boolean for compatibility with masked_loss; the
-        # weights ride along in meta and are used by `weighted_loss` below.
+        # loss_mask is boolean for compatibility with masked_loss; the weights
+        # are carried in meta and used by ``loss``.
         return TrialBatch(x, y, weight > 0, meta)
 
     def loss(self, outputs: Tensor, batch: TrialBatch) -> Tensor:
-        """Weighted masked MSE. Use this instead of ``training.masked_loss`` to
-        get the epoch and output-unit weighting; a plain boolean mask throws
-        both away."""
+        """Weighted masked MSE using the cost-mask weights and the per-unit
+        weight on the withhold unit."""
         w = batch.meta["weight"].to(outputs.device)                 # (B, T)
         unit_w = torch.ones(outputs.shape[-1], device=outputs.device)
         unit_w[WITHHOLD] = self.w_withhold
@@ -277,8 +239,8 @@ class TimingTask(Task):
 
     # -- readout ----------------------------------------------------------
     def crossing_time(self, outputs: Tensor, batch: TrialBatch) -> Tensor:
-        """First crossing of the LICK unit past threshold after cue onset, in
-        seconds. NaN if it never crosses."""
+        """Time of the first threshold crossing of the lick unit after cue
+        onset, in seconds. NaN if the unit never crosses."""
         z = outputs[..., LICK]
         B, T = z.shape
         idx = torch.arange(T, device=z.device).unsqueeze(0)
@@ -292,13 +254,11 @@ class TimingTask(Task):
         return torch.where(any_above, t, torch.full_like(t, float("nan")))
 
     def outcome_counts(self, outputs: Tensor, batch: TrialBatch) -> Dict[str, Any]:
-        """Behavioural summary, splitting ENGAGEMENT from CORRECTNESS.
+        """Behavioural summary of a batch.
 
-        The two must be tracked separately. Withholding forever is a zero-cost
-        policy that scores no errors, so a single accuracy number cannot tell an
-        agent that has learned the timing from one that has learned to do
-        nothing. Song et al. 2017 use exactly this split as their stopping
-        criterion (``p_decision >= 0.99 and p_correct >= 0.8``).
+        ``p_engaged`` (fraction of cued trials with a lick) and ``p_correct``
+        (fraction of licked trials that were rewarded) are reported separately,
+        since a model that never licks makes no errors.
         """
         t = self.crossing_time(outputs, batch)
         delay = batch.meta["delay"].to(t.device)
@@ -309,7 +269,6 @@ class TimingTask(Task):
         rew = licked & (t >= delay) & (t <= delay + window)
         miss = cued & ~licked
         n = int(cued.sum())
-        # false alarms on catch trials: licking with no cue at all
         catch = batch.meta["no_cue_trial"].to(t.device)
         fa = int((catch & ~torch.isnan(t)).sum())
         return {"rewarded": int(rew.sum()), "early": int(early.sum()),
@@ -319,7 +278,7 @@ class TimingTask(Task):
                 "catch_false_alarms": fa}
 
     def accuracy(self, outputs: Tensor, batch: TrialBatch) -> Tensor:
-        """Fraction of cued trials rewarded. Report ``outcome_counts`` alongside:
-        this number alone cannot distinguish good timing from never licking."""
+        """Fraction of cued trials rewarded. See :meth:`outcome_counts` for
+        the engagement / correctness split."""
         c = self.outcome_counts(outputs, batch)
         return torch.tensor(c["rewarded"] / max(c["n_cued"], 1))

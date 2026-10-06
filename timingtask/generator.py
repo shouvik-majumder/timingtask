@@ -1,35 +1,28 @@
 """
-timingtask.generator — the trial state machine.
-============================================================
+timingtask.generator: the trial state machine.
 
-No gym, no torch. A step-driven state machine that both faces wrap: the
-gymnasium ``Env`` (RL) and ``TimingTask(Task)`` (supervised).
+A step-driven state machine with no dependency on gymnasium or torch. It is
+wrapped by :class:`timingtask.env.TimingTaskEnv` for reinforcement learning
+and by :class:`timingtask.supervised.TimingTask` for supervised training.
 
-THE STRUCTURE, and why it is not a linear sequence of phases
-------------------------------------------------------------
-The trial has TWO INDEPENDENT AXES:
+Trial structure
+---------------
+Two independent processes define a trial:
 
-  1. A TIMER, started at cue onset, which alone decides reward eligibility:
+1. A timer, started at cue onset, which determines reward eligibility:
 
-         ITI  ->  WAITING  ->  ELIGIBLE  ->  (POST | expired)
-                  lick aborts   lick rewards
+       ITI  ->  WAITING  ->  ELIGIBLE  ->  (POST | expired)
+                lick: early  lick: rewarded
 
-  2. An OBSERVABLE CUE CHANNEL, high for ``cue_duration`` from cue onset,
-     overlapping the timer arbitrarily.
+2. The cue channel, high for ``cue_duration`` from cue onset. Its duration is
+   independent of the required delay, so a lick after the delay elapses but
+   while the cue is still on is rewarded.
 
-These are orthogonal. If the delay is shorter than the cue, a lick after the
-delay elapses but while the cue is still audible IS REWARDED. Modelling the cue
-as a phase -- as the earlier implementation did -- makes that impossible to
-express and silently bakes in an ordering the real task does not have. It also
-means no estimator can accidentally assume a cue duration, which is a standing
-rule on the analysis side (the analysis repo's condition layer).
+The stop-licking period (ITI) is drawn from a truncated exponential on every
+trial and, if ``iti_restart_on_lick`` is set, is resampled on every lick, so
+that cue onset is unpredictable from trial start.
 
-The stop-licking period (ITI) is resampled from a truncated exponential every
-trial and RESTARTS on any lick, so cue onset stays unpredictable and the animal
-must use the cue to start its timer.
-
-Time is counted in INTEGER STEPS. Float time accumulated by repeated subtraction
-drifts and lands phase boundaries a step early or late.
+Time is counted in integer steps of ``dt`` seconds.
 """
 from __future__ import annotations
 
@@ -45,11 +38,11 @@ __all__ = ["Phase", "StepResult", "TrialGenerator"]
 
 
 class Phase:
-    ITI = "iti"           # stop-licking period; a lick restarts it
-    WAITING = "waiting"   # timer running, before the delay; a lick aborts
+    ITI = "iti"           # stop-licking period
+    WAITING = "waiting"   # timer running, before the delay; a lick ends the trial unrewarded
     ELIGIBLE = "eligible" # timer past the delay; a lick is rewarded
-    POST = "post"         # after the first decisive lick; trial winds down
-    NO_CUE = "no_cue"     # catch trial: no cue, no timer, zero-input control
+    POST = "post"         # after the decisive lick; no further contingency
+    NO_CUE = "no_cue"     # catch trial: no cue, no timer
 
 
 OUTCOMES = ("ongoing", "rewarded", "early", "miss", "iti_timeout", "no_cue_complete")
@@ -69,7 +62,7 @@ class StepResult:
 class TrialGenerator:
     """Step-driven timing-task state machine.
 
-    >>> gen = TrialGenerator(TimingTaskConfig(), SchedulerConfig())
+    >>> gen = TrialGenerator(TimingTaskConfig(), DelayScheduler(SchedulerConfig()))
     >>> res = gen.step(lick=False)
     >>> res.phase
     'iti'
@@ -91,13 +84,12 @@ class TrialGenerator:
         self._iti_timeout_steps = task.steps(task.iti_timeout)
 
         self.trial_index = 0
-        # Rewarded / not, one entry per completed trial, newest last. The
-        # window this is read over is `reward_rate_window`.
+        # Rewarded / not rewarded, one entry per completed cued trial, read
+        # over a window of ``reward_rate_window`` trials.
         self._outcome_history: Deque[int] = deque(
             maxlen=max(1, int(task.reward_rate_window)))
-        # Ring of the last K trials' outcomes, most recent first. Held constant
-        # for the whole trial -- a static offset the agent can condition on from
-        # the first step, not an event it has to remember.
+        # Outcomes of the last ``n_lags`` trials, most recent first. Held
+        # constant for the whole of the current trial.
         self._n_lags = max(1, int(self.obs_cfg.n_lags))
         self._history: List[Dict[str, float]] = [
             {"reward": 0.0, "action": 0.0, "success": 0.0, "first_lick": 0.0}
@@ -131,6 +123,7 @@ class TrialGenerator:
             c.include_normalized_delay)))
 
     def observation_labels(self) -> List[str]:
+        """Names of the observation channels, in order."""
         c = self.obs_cfg
         mode = self.cfg.cue_mode
         out = []
@@ -157,6 +150,7 @@ class TrialGenerator:
         return out
 
     def observe(self) -> np.ndarray:
+        """The current observation vector, as float32."""
         c = self.obs_cfg
         mode = self.cfg.cue_mode
         v = []
@@ -182,43 +176,37 @@ class TrialGenerator:
             v.append(float(np.clip((self.delay - lo) / max(1e-8, hi - lo), 0, 1)))
         return np.asarray(v, dtype=np.float32)
 
-    # -- subjective value: an across-trial gain, not a within-trial one ----
+    # -- across-trial value gain -------------------------------------------
     @property
     def reward_rate(self) -> float:
-        """Rewarded fraction over the last `reward_rate_window` COMPLETED
-        trials in this environment. Empty history reads as the reference rate,
-        so a fresh agent starts at gain 1.0 rather than at the failure end."""
+        """Rewarded fraction over the last ``reward_rate_window`` completed
+        cued trials. An empty history reads as ``reward_rate_ref``."""
         h = self._outcome_history
         return (float(sum(h)) / len(h)) if h else float(self.cfg.reward_rate_ref)
 
     @property
     def value_gain(self) -> float:
-        """What this trial's outcome is worth right now, relative to baseline.
-
-        Above 1 after a run of failures: water matters more and throwing the
-        trial away hurts more. Below 1 after a run of successes. It multiplies
-        BOTH the water and the early-lick penalty, because they are two halves
-        of the same quantity -- the value of the opportunity this trial is.
-        """
+        """Multiplicative gain applied to the reward and the early-lick
+        penalty, as a function of the recent reward rate. See
+        :class:`~timingtask.config.TimingTaskConfig`."""
         c = self.cfg
         if not c.reward_rate_gain:
             return 1.0
         g = float(np.exp(c.reward_rate_gain * (c.reward_rate_ref - self.reward_rate)))
         return float(np.clip(g, c.reward_rate_min, c.reward_rate_max))
 
-    # -- cue channel: independent of phase --------------------------------
+    # -- cue channel ----------------------------------------------------------
     @property
     def cue_on(self) -> bool:
-        """True while the cue is audible. Depends ONLY on time since cue onset,
-        never on which timer phase the trial is in."""
+        """True while the transient cue is on. Depends only on the time since
+        cue onset."""
         if self._cue_onset_step is None:
             return False
         return 0 <= (self.step_index - self._cue_onset_step) < self._cue_steps
 
     @property
     def cue_step(self) -> bool:
-        """Tonic drive: high from cue onset for the rest of the trial. Unlike
-        `cue_on` it does not switch off after `cue_duration`."""
+        """True from cue onset until the end of the trial."""
         if self._cue_onset_step is None:
             return False
         return self.step_index >= self._cue_onset_step
@@ -252,7 +240,7 @@ class TrialGenerator:
         self._post_remaining = self._post_steps
         self._last_lick_step: Optional[int] = None
 
-        self.lick_steps: List[int] = []     # every lick, in step index
+        self.lick_steps: List[int] = []     # every accepted lick, in step index
         self.iti_licked = False
         self.trial_reward = 0.0
         self.outcome = "ongoing"
@@ -260,8 +248,8 @@ class TrialGenerator:
         self.decisive_lick_s: Optional[float] = None
 
     def _accept_lick(self) -> bool:
-        """Enforce a refractory period so a held-down action is one lick, not
-        one per step. Real lick bouts have ~100 ms inter-lick intervals."""
+        """Apply the refractory period, so that a sustained lick action counts
+        as one lick rather than one per step."""
         if self._last_lick_step is not None and \
                 (self.step_index - self._last_lick_step) < self._refractory_steps:
             return False
@@ -271,6 +259,7 @@ class TrialGenerator:
 
     # -- the step ---------------------------------------------------------
     def step(self, lick: bool) -> StepResult:
+        """Advance one step. ``lick`` is the agent's action."""
         cfg = self.cfg
         reward = (cfg.time_penalty
                   if (cfg.time_penalty_in_post or self.phase != Phase.POST)
@@ -285,7 +274,7 @@ class TrialGenerator:
                 self.iti_licked = True
                 reward += cfg.iti_lick_penalty
                 if cfg.iti_restart_on_lick:
-                    self._iti_remaining = self._sample_iti_steps()   # RESTART
+                    self._iti_remaining = self._sample_iti_steps()
                 else:
                     self._iti_remaining -= 1
             else:
@@ -293,20 +282,16 @@ class TrialGenerator:
                 if self._iti_remaining <= 0:
                     if self.is_no_cue:
                         self.phase = Phase.NO_CUE
-                        # Where the cue WOULD have fired. No cue plays and no
-                        # timer starts -- to the agent this is simply a longer
-                        # ITI -- but recording the step lets catch trials be
-                        # aligned like any other trial, so they can appear in
-                        # the raster and the lick-time distribution instead of
-                        # being silently dropped.
+                        # The step at which the cue would have occurred. No
+                        # cue is presented and no timer starts; the step is
+                        # recorded so that catch trials can be aligned to the
+                        # same reference as cued trials.
                         self._virtual_cue_step = self.step_index + 1
                         self._no_cue_remaining = self._delay_steps + self._answer_steps
                     else:
                         self.phase = Phase.WAITING
-                        # +1: observe() runs after step_index is incremented, so
-                        # the cue's first OBSERVED step is the next one. Without
-                        # this the agent never sees timer == 0 and the cue is
-                        # visible for cue_steps-1 steps instead of cue_steps.
+                        # observe() is called after step_index is incremented,
+                        # so the first observed cue step is the next one.
                         self._cue_onset_step = self.step_index + 1
             if self._iti_elapsed >= self._iti_timeout_steps:
                 reward += cfg.iti_timeout_penalty
@@ -325,7 +310,7 @@ class TrialGenerator:
                 reward += cfg.early_penalty * self.value_gain
                 self.decisive_lick_s = elapsed * cfg.dt
                 self.outcome = "early"
-                self.phase = Phase.POST          # trial continues: post-lick epoch
+                self.phase = Phase.POST
             elif elapsed + 1 >= self._delay_steps:
                 self.phase = Phase.ELIGIBLE
 
@@ -345,8 +330,8 @@ class TrialGenerator:
                 self.outcome, trial_over = "miss", True
 
         elif self.phase == Phase.POST:
-            # Trial keeps running so peri_lick / post_lick epochs exist in the
-            # generated data and lick bouts are recorded. No further contingency.
+            # The trial continues for ``post_lick`` seconds after the decisive
+            # lick so that peri-lick activity and lick bouts are recorded.
             self._post_remaining -= 1
             if self._post_remaining <= 0:
                 trial_over = True
@@ -361,9 +346,6 @@ class TrialGenerator:
 
         self.trial_reward += reward
         self.step_index += 1
-        # NB previous-trial channels are per-TRIAL constants written by
-        # _finish_trial, not per-step values. They must stay fixed for the whole
-        # trial so the agent can condition a ramp slope on them from step 0.
 
         if trial_over:
             record = self._finish_trial()
@@ -378,6 +360,8 @@ class TrialGenerator:
                           record=record)
 
     def _finish_trial(self) -> Dict[str, Any]:
+        """Build the trial record, update the scheduler and the history
+        channels, and start the next trial."""
         cfg = self.cfg
         onset = self._cue_onset_step
         lick_times = [(s - onset) * cfg.dt if onset is not None else s * cfg.dt
@@ -387,7 +371,7 @@ class TrialGenerator:
                        self.first_lick_s <= self.scheduler.cue_response_window
                        ) if onset is not None else None
 
-        # Catch trials align to where the cue would have been.
+        # Catch trials are aligned to the step at which the cue would have occurred.
         align = onset if onset is not None else self._virtual_cue_step
         align_licks = ([(s - align) * cfg.dt for s in self.lick_steps]
                        if align is not None else lick_times)
@@ -397,9 +381,8 @@ class TrialGenerator:
             "outcome": self.outcome,
             "n_iti_licks": sum(1 for s in self.lick_steps
                                if onset is None or s < onset),
-            # Duration of the stop-licking period actually experienced. Needed
-            # because a COUNT of ITI licks is not comparable across trials whose
-            # ITI lengths differ, and the promotion criterion has to be a rate.
+            # Duration of the stop-licking period actually experienced, so
+            # that ITI licking can be expressed as a rate.
             "iti_steps": int(onset if onset is not None
                              else (self._virtual_cue_step
                                    if self._virtual_cue_step is not None
@@ -427,12 +410,9 @@ class TrialGenerator:
             "value_gain": float(self.value_gain),
             "training_stage": self.scheduler.get_training_stage(),
             "dt": cfg.dt,
-            # What the agent was TOLD about the previous trial while running
-            # this one. Copied from the observation history, not reconstructed
-            # from list order: records from the 16 parallel environments arrive
-            # interleaved, so the previous entry in a record list is usually a
-            # different animal.
-            # -1 / 0 / +1, matching the channel the agent was shown.
+            # The previous-trial channels the agent observed during this
+            # trial, copied from the observation history rather than inferred
+            # from record order (records from parallel environments interleave).
             "prev_success": (float(self._history[0]["success"])
                              if self._history else None),
             "prev_reward": (float(self._history[0]["reward"])
@@ -443,7 +423,7 @@ class TrialGenerator:
                                 if self._history else None),
         }
 
-        # scheduler scores cued trials only; catch trials pass None
+        # The scheduler scores cued trials only.
         sched_success = None if self.is_no_cue or self.outcome in (
             "iti_timeout", "no_cue_complete") else rewarded
         self.scheduler.on_trial_end(sched_success, rec)
@@ -451,13 +431,8 @@ class TrialGenerator:
         rec["next_training_stage"] = self.scheduler.get_training_stage()
         rec["stage_transitioned"] = bool(self.scheduler.last_stage_transition)
 
-        # SIGNED outcome: +1 rewarded, -1 responded and was wrong, 0 no
-        # decision was made. Zero is not "failure", it is "no evidence" -- and
-        # it must be reserved for that, because a channel that is exactly 0.0
-        # contributes a gradient of exactly delta_i * 0 to its input weights,
-        # so a long unrewarded run under the old 1/0 coding froze that column
-        # of W_in completely. Under +1/-1 an unrewarded trial still carries
-        # signal, and the column keeps moving.
+        # Signed outcome channel: +1 rewarded, -1 responded and unrewarded,
+        # 0 no response.
         signed = (1.0 if rewarded
                   else (0.0 if self.decisive_lick_s is None else -1.0))
         self._history.insert(0, {
@@ -466,9 +441,7 @@ class TrialGenerator:
             "success": signed,
             "first_lick": float(self.first_lick_s or 0.0)})
         del self._history[self._n_lags:]
-        # Only cued trials count toward the reward rate -- a catch trial has no
-        # water to win, so scoring it as a failure would drag the gain down for
-        # a reason the agent cannot act on.
+        # Only cued trials that reached a cue count toward the reward rate.
         if not self.is_no_cue and self.outcome != "iti_timeout":
             self._outcome_history.append(int(bool(rewarded)))
         self.trial_index += 1

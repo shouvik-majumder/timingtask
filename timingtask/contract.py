@@ -1,32 +1,16 @@
 """
-timingtask.contract — the batched-trial interface shared by task and trainer.
-============================================================================
+timingtask.contract: the batched-trial interface shared by tasks and trainers.
 
-Three objects, no logic beyond bookkeeping:
-
-    TaskSpec    static description of a task — dims, loss type, channel names
+    TaskSpec    static description of a task: dimensions, loss type, labels
     TrialBatch  one batch of trials: inputs, targets, loss_mask, meta
     Task        base class; subclasses set ``spec`` and implement ``sample``
 
-Why this lives here and not in ``neuralgeom``
----------------------------------------------
-It was vendored from ``timingtask.contract`` when the timing task moved
-into its own repository. The two copies are deliberately independent: this one
-is free to grow whatever a timing agent needs (continuous readouts, per-step
-reward, non-episodic training) without moving a contract that four cognitive
-tasks in the other repository already depend on.
-
-The two repositories meet in exactly one place, and it is not this file — it is
-the ``Trajectory`` HDF5 schema written by :mod:`timingtask.export`.
-
 Conventions
 -----------
-* Time is discretized with a step ``dt`` (MILLISECONDS here, unlike the
-  ``TimingTaskConfig`` dataclasses, which are in seconds; ``supervised.py``
-  converts between them).
-* Trials in a batch share one tensor length ``T``; per-trial epoch boundaries
-  vary and are carried by ``loss_mask``, so variable timing needs no ragged
-  tensors.
+* Time is discretised with step ``dt`` in milliseconds (the configuration
+  dataclasses use seconds; ``supervised.py`` converts).
+* Trials in a batch share one tensor length ``T``. Per-trial epoch boundaries
+  vary and are carried by ``loss_mask``.
 * Targets are ``(B, T)`` int64 class labels for cross-entropy, or
   ``(B, T, out)`` float for MSE.
 """
@@ -44,7 +28,7 @@ __all__ = ["TaskSpec", "TrialBatch", "Task"]
 
 @dataclass
 class TaskSpec:
-    """Static description of a task — everything a model/trainer needs."""
+    """Static description of a task."""
     name: str
     input_dim: int
     output_dim: int
@@ -79,14 +63,15 @@ class TrialBatch:
 
 
 class Task:
-    """Base class. Subclasses implement ``sample`` and set ``spec``."""
+    """Base class for batched tasks. Subclasses implement ``sample`` and set
+    ``spec``."""
 
     spec: TaskSpec
 
     def __init__(self, dt: float = 20.0, sigma: float = 0.15,
                  seed: Optional[int] = None):
         self.dt = float(dt)
-        self.sigma = float(sigma)          # input noise SD (scaled by dt below)
+        self.sigma = float(sigma)          # input noise SD, scaled by dt in _noise
         self._gen = torch.Generator()
         if seed is not None:
             self._gen.manual_seed(int(seed))
@@ -107,16 +92,17 @@ class Task:
         return torch.randint(high, shape, generator=self._gen)
 
     def _noise(self, shape) -> Tensor:
-        """Input noise scaled so its effect is dt-independent."""
+        """Input noise scaled so that its effect is independent of dt."""
         return self.sigma * math.sqrt(2.0 * 100.0 / self.dt) * self._randn(*shape)
 
     def sample(self, batch_size: int) -> TrialBatch:
         raise NotImplementedError
 
     def accuracy(self, outputs: Tensor, batch: TrialBatch) -> Tensor:
-        """Fraction of trials whose majority decision-epoch output is correct.
+        """Per-trial fraction of masked positions whose argmax matches the
+        target. Defined for classification tasks only.
 
-        outputs : (B, T, out) logits. Uses the same mask the loss uses.
+        outputs : (B, T, out) logits.
         """
         if self.spec.loss != "cross_entropy":
             raise NotImplementedError("accuracy defined for classification tasks")
@@ -127,4 +113,3 @@ class Task:
 
     def __repr__(self) -> str:
         return f"{self.spec.name}(dt={self.dt}, sigma={self.sigma})"
-

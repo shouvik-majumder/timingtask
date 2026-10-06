@@ -1,25 +1,25 @@
 """
-timingtask.plots — rig-style monitoring and model diagnostics.
-===========================================================================
+timingtask.plots: behavioural and network diagnostics.
 
-Two dashboards, both drawing from the flat trial records the generator emits:
+All figures are drawn from the trial records emitted by the generator and
+the history returned by the trainers:
 
-  * BEHAVIOUR -- what a lab watches while training an animal: lick raster,
-    first-lick times against the criterion, rolling accuracy, outcome mix,
-    lick-time distributions, ITI licking, reward.
-  * MODEL -- what only a simulation can show: unit activity, the readout
-    against its threshold, PSTHs, trajectories.
+  * Behaviour: lick raster, first-lick times against the required delay,
+    rolling accuracy, outcome proportions, lick-time distributions, ITI
+    licking, reward rate.
+  * Network: unit activity, the readout against its threshold, population
+    PSTHs, state-space trajectories.
+  * Training: loss terms, gradient norm, behavioural metrics and the
+    curriculum against update index; policy and value head diagnostics.
 
-Every panel function takes an ``ax`` and draws into it, so panels compose into
-whatever figure you want and nothing here opens or saves a file. The dashboard
-helpers are thin wrappers that lay panels out.
+Each panel function draws into a supplied ``ax``. The dashboard functions
+compose panels into figures; :func:`run_report` produces every figure for a
+training run.
 
-Colours follow one rule: outcome is a CATEGORICAL variable with a FIXED slot
-order, so "early" is the same colour in every figure, in every run, whatever
-subset is present. The palette is Okabe-Ito, which is colourblind-safe
-(validated: worst adjacent pair dE 11.0 deuteranopia). Anything ordered by
-magnitude -- delay, lick-time bin, trial number -- uses a single-hue sequential
-ramp instead, never a rainbow.
+Trial outcomes use a fixed categorical palette (Okabe-Ito) with a fixed slot
+order, so each outcome has the same colour in every figure. Ordered variables
+(delay, lick-time bin, trial block) use a single-hue sequential colour map.
+matplotlib and, for the PCA panel, scikit-learn are imported on first use.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ __all__ = [
     "plot_readout", "plot_psth", "plot_pca_trajectories", "model_dashboard",
 ]
 
-# Fixed categorical slots. Never cycled, never reordered by frequency.
+# Fixed slot order and colours for trial outcomes.
 OUTCOME_ORDER = ("rewarded", "early", "miss", "no_cue_complete", "iti_timeout")
 OUTCOME_COLORS = {
     "rewarded":        "#0072B2",   # blue
@@ -61,7 +61,7 @@ _INK = "0.25"
 
 
 def _style(ax, xlabel="", ylabel="", title=""):
-    """Recessive axes: the data should be the darkest thing in the frame."""
+    """Apply the common axis style and labels."""
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
     for s in ("left", "bottom"):
@@ -94,9 +94,7 @@ def _rolling(x, w):
 
 
 def _rolling_median(x, w):
-    """Median in a sliding window. Preferred over the mean for lick times:
-    the distribution is right-skewed and a single very late lick drags a mean
-    by more than it should."""
+    """Median over a sliding window of width ``w``."""
     x = np.asarray(x, float)
     if len(x) == 0:
         return x
@@ -105,17 +103,14 @@ def _rolling_median(x, w):
 
 
 # --------------------------------------------------------------------------- #
-# 1. Task inspection -- the debugging tools
+# 1. Trial inspection
 # --------------------------------------------------------------------------- #
 def trial_trace(generator, policy=None, max_steps: int = 5000) -> List[Dict[str, Any]]:
-    """Roll ONE trial and return a per-step trace.
+    """Run one trial and return a per-step trace of phase, cue state, timer,
+    action and reward.
 
-    The first thing to look at when the task structure is in doubt: it shows,
-    step by step, the phase, whether the cue is audible, the timer, the action
-    and the reward -- so a phase boundary landing in the wrong place is visible
-    directly rather than inferred from summary statistics.
-
-    ``policy(generator) -> bool`` decides the lick; the default never licks.
+    ``policy(generator) -> bool`` decides whether to lick at each step; the
+    default never licks.
     """
     if policy is None:
         policy = lambda g: False                                   # noqa: E731
@@ -136,8 +131,8 @@ def trial_trace(generator, policy=None, max_steps: int = 5000) -> List[Dict[str,
 
 
 def print_trial_trace(rows, every: int = 1, transitions_only: bool = False):
-    """Print a trace. ``transitions_only`` collapses to the interesting steps:
-    phase changes, cue on/off, licks, and the last step."""
+    """Print a trace. ``transitions_only`` restricts the output to phase
+    changes, cue transitions, licks and the final step."""
     print(f"{'step':>5} {'phase':<9} {'cue':>4} {'timer':>7} {'delay':>6} "
           f"{'lick':>5} {'reward':>8}  outcome")
     prev = None
@@ -157,16 +152,13 @@ def print_trial_trace(rows, every: int = 1, transitions_only: bool = False):
 
 def plot_trial_timeline(ax, record: Dict[str, Any], *, show_legend=True,
                         xlim: Optional[Tuple[float, float]] = None):
-    """One trial on a time axis: the timer's regions, the cue channel, licks.
+    """One trial on a time axis: the timer epochs, the cue channel and the licks.
 
-    The cue is drawn as its own band ABOVE the timer regions, not as one of
-    them, because it overlaps the timer arbitrarily -- if the delay is shorter
-    than the cue, part of the rewarded window happens while the cue is still
-    audible. A phase model cannot draw this picture.
-
-    The shaded regions show the trial's STRUCTURE (what would have happened),
-    which extends past where the trial actually ended; the dotted line marks the
-    real end. Pass a common ``xlim`` so panels are comparable.
+    The cue is drawn as a separate band above the timer epochs, since its
+    duration is independent of the delay. The shaded epochs show the trial
+    structure, which may extend past the point at which the trial ended; the
+    dotted line marks the actual end. Pass a common ``xlim`` to make panels
+    comparable.
     """
     dt = record.get("dt", 0.02)
     delay = float(record["delay"])
@@ -192,7 +184,7 @@ def plot_trial_timeline(ax, record: Dict[str, Any], *, show_legend=True,
         ax.axvline(0, color=_INK, lw=1.0, zorder=2)
         ax.axvline(delay, color=_INK, lw=1.0, ls="--", zorder=2)
         ax.axvline(t1, color=_INK, lw=.9, ls=":", zorder=2)      # trial ended
-        # the cue band -- an independent axis, drawn above the timer regions
+        # cue band, drawn above the timer epochs
         ax.axvspan(0, cue_d, ymin=.86, ymax=1.0, color=_INK, alpha=.55, zorder=3)
         ax.text(cue_d / 2, .93, "cue", ha="center", va="center", fontsize=7,
                 color="white", transform=ax.get_xaxis_transform(), zorder=4)
@@ -219,9 +211,9 @@ def plot_trial_timeline(ax, record: Dict[str, Any], *, show_legend=True,
         from matplotlib.lines import Line2D
         ax.legend(handles=[
             Patch(color="0.92", label="stop-licking period"),
-            Patch(color=OUTCOME_COLORS["early"], alpha=.3, label="delay — lick aborts"),
-            Patch(color=OUTCOME_COLORS["rewarded"], alpha=.3, label="answer — lick rewards"),
-            Patch(color=_INK, alpha=.55, label="cue audible"),
+            Patch(color=OUTCOME_COLORS["early"], alpha=.3, label="delay (lick: early)"),
+            Patch(color=OUTCOME_COLORS["rewarded"], alpha=.3, label="answer window (lick: rewarded)"),
+            Patch(color=_INK, alpha=.55, label="cue on"),
             Line2D([], [], color=_INK, ls=":", label="trial end")],
             fontsize=7, frameon=False, ncol=5, loc="lower center",
             bbox_to_anchor=(.5, 1.18))
@@ -229,11 +221,8 @@ def plot_trial_timeline(ax, record: Dict[str, Any], *, show_legend=True,
 
 
 def plot_trial_timelines(records, *, outcomes=OUTCOME_ORDER, figsize=(11, 2.1)):
-    """One panel per requested outcome, on a COMMON time axis.
-
-    Reports any outcome class that did not occur, rather than silently drawing
-    fewer panels -- an absent class is usually the interesting part.
-    """
+    """One example trial per requested outcome, on a common time axis.
+    Outcomes with no example are reported and skipped."""
     import matplotlib.pyplot as plt
     picks, missing = [], []
     for name in outcomes:
@@ -256,14 +245,10 @@ def plot_trial_timelines(records, *, outcomes=OUTCOME_ORDER, figsize=(11, 2.1)):
 
 
 # --------------------------------------------------------------------------- #
-# 2. Behaviour dashboard -- the rig view
+# 2. Behaviour dashboard
 # --------------------------------------------------------------------------- #
 def plot_lick_raster(ax, records, *, max_trials: int = 400):
-    """Every lick, cue-aligned, trial on y, with the criterion staircase.
-
-    The criterion drawn against the behaviour is the point: on an autolearn
-    schedule you want to see the licks tracking the staircase up.
-    """
+    """Cue-aligned lick raster (trial on y) with the required delay overlaid."""
     recs = [r for r in records if r.get("cue_onset_step") is not None][-max_trials:]
     for i, r in enumerate(recs):
         lt = np.asarray(r.get("lick_times_s") or [], dtype=float)
@@ -327,8 +312,7 @@ def plot_rolling_accuracy(ax, records, *, window: int = 100,
 
 
 def plot_outcome_proportions(ax, records, *, window: int = 50):
-    """Stacked outcome mix over trials. Fixed slot order, so the bands mean the
-    same thing between runs."""
+    """Stacked outcome proportions over a rolling window of trials."""
     if len(records) < 2:
         return _style(ax, "trial", "proportion", "outcome mix")
     names = [r["outcome"] for r in records]
@@ -373,8 +357,8 @@ def plot_first_lick_hist(ax, records, *, recent: int = 200, bins: int = 40):
 
 
 def plot_iti_lick_rate(ax, records, *, window: int = 50):
-    """Pre-cue licking. Gates promotion out of cue association, and a run where
-    this stays high is an agent that never really engages with the cue."""
+    """Fraction of trials with at least one lick before the cue, over a
+    rolling window."""
     y = np.array([bool(r.get("iti_licked")) for r in records], float)
     if len(y) >= 2:
         w = min(window, len(y))
@@ -386,8 +370,7 @@ def plot_iti_lick_rate(ax, records, *, window: int = 50):
 
 
 def plot_reward(ax, records, *, window: int = 50):
-    """Reward RATE, not just the cumulative curve -- a cumulative plot rises
-    even while performance is falling."""
+    """Per-trial reward over a rolling window."""
     r = _arr(records, "trial_reward")
     if len(r) >= 2:
         w = min(window, len(r))
@@ -400,8 +383,7 @@ def plot_reward(ax, records, *, window: int = 50):
 
 
 def plot_iti_durations(ax, records, *, bins: int = 30):
-    """Time from trial start to cue. Should look like a truncated exponential;
-    a heavy right tail means licking is restarting the clock a lot."""
+    """Histogram of the time from trial start to cue onset."""
     d = np.array([r["cue_onset_step"] * r.get("dt", .02) for r in records
                   if r.get("cue_onset_step") is not None], float)
     if d.size:
@@ -415,7 +397,7 @@ def plot_iti_durations(ax, records, *, bins: int = 30):
 
 def behaviour_dashboard(records, *, figsize=(15, 11), window: int = 50,
                         title: Optional[str] = None):
-    """The rig view. Returns ``(fig, axes_dict)``."""
+    """Behavioural summary figure. Returns ``(fig, axes_dict)``."""
     import matplotlib.pyplot as plt
     fig, axs = plt.subplots(4, 2, figsize=figsize)
     a = {"raster": axs[0, 0], "first_lick": axs[0, 1],
@@ -443,27 +425,18 @@ def align_to_cue(H, onsets, *, pre: int = 10, post: int = 120, lengths=None,
                  min_trials: float = 0.5):
     """Re-slice ``(B, T, N)`` activity to a common cue-aligned window.
 
-    Trials have different ITI lengths, so cue onset lands at a different index
-    in every one. Averaging without aligning first smears the cue response into
-    nothing -- the commonest way to make a PSTH look flat.
+    ``onsets`` gives the cue-onset step of each trial (negative for trials
+    without a cue, which are dropped). ``lengths`` gives each trial's true
+    length; steps beyond it are set to NaN so that padding in a batched
+    rollout is excluded. Pass ``batch.meta["trial_len"]`` for batches from
+    :class:`~timingtask.supervised.TimingTask`.
 
-    ``lengths`` IS NOT OPTIONAL IN PRACTICE. A batch pads every trial out to the
-    longest one with ZEROS, and a recurrent network keeps running over that
-    padding, producing hidden states and a readout that are the network's
-    response to zero input rather than anything about the task. The loss mask
-    hides this during training; a PSTH does not. Symptom: every trace does the
-    same thing at the same step -- a bump, a crash below zero, a slow drift --
-    starting exactly where the shortest trials end. Pass ``batch.meta["trial_len"]``
-    and it becomes NaN instead.
-
-    ``min_trials`` trims timepoints where too few trials are still running.
-    A value below 1 is a FRACTION of trials (the default, 0.5, keeps only
-    timepoints where at least half the trials are live); 1 or more is an
-    absolute count. Without it the tail of every average is carried by the few
-    longest trials and shows up as a spike.
+    ``min_trials`` trims time points at which too few trials are still
+    running: a value below 1 is a fraction of trials, 1 or more an absolute
+    count.
 
     Returns ``(A, t)``: ``A`` is ``(n_kept, n_steps, N)``, NaN outside each
-    trial's real extent, and ``t`` is the step offset from cue onset.
+    trial's extent, and ``t`` is the step offset from cue onset.
     """
     H = np.asarray(H)
     onsets = np.asarray(onsets)
@@ -485,10 +458,6 @@ def align_to_cue(H, onsets, *, pre: int = 10, post: int = 120, lengths=None,
     out = out[keep]
     t = np.arange(-pre, post)
     if min_trials and len(out):
-        # A timepoint kept alive by a handful of long trials is not an average;
-        # it produces a bright stripe at the tail of every PSTH and heatmap.
-        # A FRACTION (< 1) is the sane default -- an absolute count scales
-        # wrongly with batch size.
         need = (max(1, int(round(min_trials * len(out)))) if min_trials < 1
                 else min(int(min_trials), len(out)))
         n_live = (~np.isnan(out[:, :, 0])).sum(axis=0)
@@ -515,15 +484,14 @@ def _nanmax(a, axis=None):
 
 
 def _nanmean(a, axis=None):
-    """np.nanmean without the all-NaN-slice warning: a fully-padded column is
-    expected once trial lengths are respected, and NaN is the right answer."""
+    """``np.nanmean`` without the all-NaN-slice warning."""
     return _nanreduce(np.nanmean, a, axis)
 
 
 def _peak_sort(A, *, split_half: bool = True):
-    """Order units by latency to peak. Sorting and displaying on the SAME data
-    manufactures a diagonal out of noise, so sort on one half of the trials and
-    display the other."""
+    """Order units by latency to peak. With ``split_half`` the order is
+    computed on alternate trials and the mean of the remaining trials is
+    displayed."""
     n = A.shape[0]
     if split_half and n >= 4:
         sort_src, show_src = A[0::2], A[1::2]
@@ -539,8 +507,7 @@ def _peak_sort(A, *, split_half: bool = True):
 
 
 def _mark_licks(ax, lick_steps, *, y=None, color=None, label="lick"):
-    """Draw the lick times. Without these every panel is a picture of activity
-    with no reference to the behaviour that produced it."""
+    """Mark the median lick time and its interquartile range."""
     if lick_steps is None:
         return
     L = np.asarray([x for x in np.ravel(lick_steps) if np.isfinite(x)], float)
@@ -557,8 +524,6 @@ def plot_activity_heatmap(ax, A, t, *, split_half: bool = True, cmap="viridis",
                           lick_steps=None):
     """Units x time, sorted by latency to peak. Sequential ramp, single hue."""
     M, order = _peak_sort(A, split_half=split_half)
-    # np.ptp and np.min do NOT skip NaN -- a single NaN in a column made the
-    # whole normalised column NaN and the image rendered blank.
     lo = _nanmin(M, axis=0)
     hi = _nanmax(M, axis=0)
     z = (M - lo) / (hi - lo + 1e-9)
@@ -575,7 +540,7 @@ def plot_activity_heatmap(ax, A, t, *, split_half: bool = True, cmap="viridis",
 
 def plot_unit_traces(ax, A, t, *, units: Optional[Sequence[int]] = None,
                      n: int = 6, lick_steps=None):
-    """A few single units. Sequential ramp by unit index, not a rainbow."""
+    """Trial-averaged traces of the most modulated units."""
     import matplotlib.cm as cm
     M = _nanmean(A, axis=0)
     if units is None:
@@ -592,11 +557,7 @@ def plot_unit_traces(ax, A, t, *, units: Optional[Sequence[int]] = None,
 
 def plot_readout(ax, Z, t, *, threshold: float = 1.0, delays=None,
                  outcomes=None, max_traces: int = 60, lick_steps=None):
-    """The readout against its threshold -- where ramp-to-bound is visible.
-
-    Traces are coloured by outcome so early crossings are distinguishable from
-    rewarded ones at a glance.
-    """
+    """Single-trial readout traces against the threshold, coloured by outcome."""
     Z = np.asarray(Z)
     n = min(len(Z), max_traces)
     for i in range(n):
@@ -618,11 +579,7 @@ def plot_readout(ax, Z, t, *, threshold: float = 1.0, delays=None,
 
 def plot_psth(ax, A, t, *, groups=None, group_name="lick-time bin",
               cmap="viridis", lick_steps=None):
-    """Population-mean PSTH, optionally split by a group label.
-
-    Group colours use a sequential ramp because the groups are ORDERED (early
-    to late lick times); a categorical palette would imply they are not.
-    """
+    """Population-mean PSTH, optionally split by an ordered group label."""
     import matplotlib.cm as cm
     if groups is None:
         ax.plot(t, _nanmean(A, axis=(0, 2)), color=_INK, lw=1.8)
@@ -646,15 +603,14 @@ def plot_psth(ax, A, t, *, groups=None, group_name="lick-time bin",
 
 def plot_pca_trajectories(ax, A, t, *, groups=None, n_show: int = 40,
                           cmap="viridis", lick_steps=None, center: bool = False):
-    """Trajectories in the top two PCs of the cue-aligned activity.
+    """Trajectories in the first two principal components of the cue-aligned
+    activity.
 
-    ``center=True`` removes each trial's own mean before the PCA. Use it when
-    the leading PC is a STATIC per-trial offset rather than dynamics -- which
-    happens whenever a constant input channel (the previous trial's outcome,
-    held fixed for the whole trial) differs between trials. The symptom is
-    scattered short arcs that look disconnected: the plot is showing where each
-    trial sits, not where it goes. Compare the printed across/within ratio; if
-    it is much greater than 1 the uncentred plot is dominated by the offset.
+    ``center=True`` removes each trial's mean before the PCA, which separates
+    within-trial dynamics from static per-trial offsets (for example those
+    induced by the constant previous-trial input channels). The title reports
+    the ratio of across-trial to within-trial spread along PC1 when it is
+    large.
     """
     import matplotlib.cm as cm
     from sklearn.decomposition import PCA
@@ -709,12 +665,10 @@ def model_dashboard(H, Z, onsets, *, delays=None, outcomes=None, groups=None,
                     lengths=None, lick_steps=None, threshold: float = 1.0,
                     pre: int = 10, post: int = 120, min_trials: float = 0.5,
                     figsize=(15, 8), title: Optional[str] = None):
-    """The model view. ``H`` is ``(B, T, N)`` hidden activity, ``Z`` is
-    ``(B, T)`` readout, ``onsets`` the per-trial cue-onset step.
-
-    Pass ``lengths=batch.meta["trial_len"]`` -- without it every panel here
-    includes the network's response to post-trial zero padding. See
-    :func:`align_to_cue`.
+    """Network summary figure. ``H`` is ``(B, T, N)`` hidden activity, ``Z``
+    is the ``(B, T)`` readout and ``onsets`` the per-trial cue-onset step.
+    Pass ``lengths`` so that padding beyond each trial's end is excluded (see
+    :func:`align_to_cue`).
     """
     import matplotlib.pyplot as plt
     A, t = align_to_cue(H, onsets, pre=pre, post=post, lengths=lengths,
@@ -734,8 +688,6 @@ def model_dashboard(H, Z, onsets, *, delays=None, outcomes=None, groups=None,
                  outcomes=outc, lick_steps=lick)
     plot_psth(axs[1, 0], A, t, groups=grp, lick_steps=lick)
     plot_pca_trajectories(axs[1, 1], A, t, groups=grp, lick_steps=lick)
-    # Same data, per-trial mean removed: if the uncentred panel is dominated by
-    # a static offset this is where the actual dynamics become visible.
     plot_pca_trajectories(axs[1, 2], A, t, groups=grp, lick_steps=lick,
                           center=True)
     if title:
@@ -745,11 +697,8 @@ def model_dashboard(H, Z, onsets, *, delays=None, outcomes=None, groups=None,
 
 
 # --------------------------------------------------------------------------- #
-# 4. Training diagnostics -- what the optimiser was doing, next to behaviour
+# 4. Training diagnostics
 # --------------------------------------------------------------------------- #
-# Distinct from the outcome palette on purpose: these are loss terms, not
-# behavioural categories, and colouring them from the same set invites reading
-# a relationship that is not there.
 _TERM_COLORS = {
     "policy_loss":  "#0072B2",
     "value_loss":   "#D55E00",
@@ -770,13 +719,8 @@ _TERM_LABELS = {
 
 def plot_loss_terms(ax, hist, *, keys=("policy_loss", "value_loss", "entropy",
                                        "act_pen", "dact_pen"), logy=True):
-    """Each loss term against update index, on one axis.
-
-    The terms are plotted RAW, not multiplied by their coefficients: the raw
-    value is the quantity being controlled (mean squared activity, entropy in
-    nats), and multiplying it by the coefficient hides whether the quantity
-    moved or the price did. Log scale because they span three decades.
-    """
+    """Loss terms against update index, before multiplication by their
+    coefficients, on a log scale."""
     x = np.asarray(hist.get("step", []), float)
     any_plotted = False
     for k in keys:
@@ -799,9 +743,7 @@ def plot_loss_terms(ax, hist, *, keys=("policy_loss", "value_loss", "entropy",
 
 
 def plot_grad_norm(ax, hist, *, clip: Optional[float] = None):
-    """Gradient norm before clipping. A trace pinned at the clip line means the
-    update is being throttled every step and the effective learning rate is no
-    longer the one that was set."""
+    """Gradient norm before clipping, with the clip value marked."""
     x, y = hist.get("step", []), hist.get("grad_norm", [])
     if y:
         n = min(len(x), len(y))
@@ -837,12 +779,8 @@ def plot_training_metrics(ax, hist, *, keys=("p_engaged", "p_correct",
 
 
 def plot_delay_and_iti(ax, hist):
-    """Required delay (batch mean) and ITI licks per trial, twin axes.
-
-    NB the delay here is the MEAN over the parallel environments, each of which
-    carries its own scheduler and is at its own delay. A value of 0.26 is not a
-    broken 0.1 s step -- it is a mixture of environments at 0.2 and at 0.3.
-    """
+    """Required delay (mean over the parallel environments) and ITI licks per
+    trial, on twin axes."""
     x = np.asarray(hist.get("step", []), float)
     d = hist.get("delay")
     if d:
@@ -866,12 +804,9 @@ def plot_delay_and_iti(ax, hist):
 
 def training_dashboard(hist, *, figsize=(13, 8), title=None, clip=None,
                        boundaries=None):
-    """Optimiser view: loss terms, gradient, metrics, curriculum.
-
-    ``boundaries`` marks the updates at which the training SCHEDULE changed --
-    the curriculum handing over to a held long delay, then to switching blocks.
-    Without them a phased run reads as one continuous curve and a jump caused
-    by the task changing looks like something the optimiser did.
+    """Training figure: loss terms, gradient norm, behavioural metrics and the
+    curriculum against update index. ``boundaries`` marks the updates at which
+    the delay schedule changed in a staged run.
     """
     import matplotlib.pyplot as plt
     fig, axs = plt.subplots(2, 2, figsize=figsize)
@@ -895,19 +830,13 @@ def run_report(hist, train_records=None, eval_records=None, *,
                snapshots=None, name="run",
                out_dir=None, clip=None, window: int = 50, n_blocks: int = 5,
                block: Optional[int] = None, dpi: int = 130):
-    """Every diagnostic for one run. Returns {label: figure}.
+    """Produce every figure for one training run. Returns ``{label: figure}``
+    and, with ``out_dir``, saves each as ``<name>_<label>.png``.
 
-    Separate figures because they answer separate questions: the optimiser over
-    UPDATES; the two heads, also over updates, since weights move once per
-    update and never within a trial; behaviour over TRIALS during training,
-    which is where the lick timing is actually shaped; the probe, where the
-    weights are fixed but the delay keeps growing; and each named test
-    condition. A raster that mixes them is unreadable.
-
-    ``eval_records`` no longer gets its own behaviour figure -- testing at
-    whatever delay training happened to stop on cannot separate an agent that
-    times from one that memorised an interval. It is kept because it is the
-    source of the network-internals and value-head panels.
+    Figures: the training dashboard and the heads dashboard against update
+    index; behaviour and trial-history dashboards for the training records
+    (and for each training phase, if given), for each test condition and for
+    the probe; and the network-internals figure from ``eval_records``.
     """
     import matplotlib.pyplot as plt
     figs = {}
@@ -923,9 +852,6 @@ def run_report(hist, train_records=None, eval_records=None, *,
             train_records, n_blocks=n_blocks, block=block,
             title=f"{name} -- distributions, trial history, readout "
                   f"(training)")[0]
-    # One behaviour figure per TRAINING PHASE. The phases are different tasks
-    # -- a growing delay, a held one, switching blocks -- and a raster that
-    # pools them is three experiments in one panel.
     for pname, recs in (phases or {}).items():
         if not recs:
             continue
@@ -943,7 +869,7 @@ def run_report(hist, train_records=None, eval_records=None, *,
     if eval_records and any(r.get("hidden") is not None for r in eval_records):
         try:
             figs["model"] = _model_figure(eval_records, name)
-        except Exception:          # geometry panels are optional diagnostics
+        except Exception:          # optional; requires scikit-learn
             pass
     for label, recs in (tests or {}).items():
         if not recs:
@@ -974,7 +900,7 @@ def run_report(hist, train_records=None, eval_records=None, *,
 
 
 # --------------------------------------------------------------------------- #
-# 5. Learning over trials -- distributions, trial history, the policy readout
+# 5. Lick-time distributions, trial history and the policy readout
 # --------------------------------------------------------------------------- #
 def _first_licks(records, cued_only=True):
     rs = [r for r in records
@@ -984,17 +910,11 @@ def _first_licks(records, cued_only=True):
 
 
 def trial_groups(n, *, n_blocks: int = 5, block: Optional[int] = None):
-    """Split ``n`` trials into consecutive groups, as (start, stop) pairs.
+    """Split ``n`` trials into consecutive groups, as ``(start, stop)`` pairs.
 
-    Two independent binnings exist in these figures and confusing them is easy:
-    THIS one groups TRIALS (the curves, chronological), while ``bin_ms`` below
-    is the width of the histogram bin on the TIME axis. They have nothing to do
-    with each other.
-
-    ``n_blocks`` gives equal-count groups -- quintiles by default, so every
-    curve rests on the same number of trials however long the run. ``block``
-    overrides it with a fixed number of trials per group, capped so a 10k-trial
-    run cannot draw fifty unreadable curves.
+    ``n_blocks`` gives equal-count groups. ``block`` instead gives a fixed
+    number of trials per group, with the group size raised if necessary so
+    that there are at most eight groups.
     """
     if n <= 0:
         return []
@@ -1007,9 +927,7 @@ def trial_groups(n, *, n_blocks: int = 5, block: Optional[int] = None):
 
 
 def _smooth(y, k=3):
-    """Moving average over k bins. Removes the single-bin spikes that a 50 ms
-    histogram of a few hundred trials is mostly made of, without moving the
-    mode the way a wider bin would."""
+    """Moving average over ``k`` histogram bins."""
     if k <= 1 or len(y) < k:
         return y
     return np.convolve(y, np.ones(k) / k, mode="same")
@@ -1021,12 +939,8 @@ def plot_first_lick_hist_blocks(ax, records, *, n_blocks: int = 5,
                                 xmax: Optional[float] = None):
     """First-lick density in consecutive groups of trials, dark to light.
 
-    ``bin_ms`` is the width of the histogram bin on the TIME axis (50 ms).
-    ``n_blocks`` is how many chronological groups of TRIALS get their own curve
-    (5 equal-count groups). The two are unrelated; the title states both.
-
-    A single 'last 200' histogram cannot show a distribution moving, which is
-    the whole question when the required delay is growing underneath it.
+    ``bin_ms`` is the histogram bin width on the time axis; ``n_blocks`` (or
+    ``block``) sets the grouping of trials, see :func:`trial_groups`.
     """
     rs, fl = _first_licks(records)
     if not len(fl):
@@ -1053,12 +967,7 @@ def plot_first_lick_hist_blocks(ax, records, *, n_blocks: int = 5,
 def plot_first_lick_hist_by_delay(ax, records, *, bin_ms: float = 50.0,
                                   smooth: int = 3, min_trials: int = 20,
                                   xmax: Optional[float] = None):
-    """First-lick density separately for each required delay.
-
-    The direct test of timing: if the agent is reading the trial rather than
-    repeating one interval, each curve should sit to the right of the last by
-    about the delay increment, and the dashed lines mark where each should be.
-    """
+    """First-lick density for each required delay, with each delay marked."""
     rs, fl = _first_licks(records)
     if not len(fl):
         return _style(ax, "first lick (s from cue)", "density", "by delay")
@@ -1088,11 +997,8 @@ def plot_first_lick_hist_by_delay(ax, records, *, bin_ms: float = 50.0,
 
 
 def plot_value_gain(ax, hist):
-    """The across-trial value gain and the reward rate that drives it.
-
-    Above 1 the agent has been failing and water is worth more than baseline;
-    below 1 it has been succeeding and water is worth less. Flat at 1.0 means
-    `reward_rate_gain` is off."""
+    """The across-trial value gain and the reward rate it is computed from,
+    against update index."""
     x = np.asarray(hist.get("step", []), float)
     y = hist.get("value_gain")
     if y:
@@ -1116,16 +1022,8 @@ def plot_value_gain(ax, hist):
 
 
 def plot_delay_spread(ax, hist):
-    """Required delay against update, with an axis that starts at zero.
-
-    Each parallel environment runs its own scheduler and each only ever
-    increases its delay -- the promotion rule adds ``delay_step`` and has no
-    branch that subtracts. Any wobble in this line is the BATCH MEAN moving
-    because catch trials are excluded and different environments drop out of
-    the average, not a delay going down. On an autoscaled axis a constant
-    0.100 renders as a wandering line across a 0.005 range, which is why the
-    limit is pinned here.
-    """
+    """Required delay (mean over the parallel environments) against update
+    index, on an axis starting at zero."""
     x = np.asarray(hist.get("step", []), float)
     d = hist.get("delay")
     if d:
@@ -1144,13 +1042,11 @@ _HIST_COLORS = {"rewarded": OUTCOME_COLORS["rewarded"],
 
 
 def _prev_outcome(records):
-    """(records with a first lick, boolean 'previous trial was rewarded').
+    """Return ``(records with a first lick, previous-trial-rewarded flags)``.
 
-    Uses the record's own ``success_t-1`` semantics: the previous trial in the
-    SAME environment. Records arrive interleaved across the 16 parallel
-    environments, so the neighbour in the list is usually a different animal --
-    reconstructing 'previous' by list position would be wrong. Falls back to
-    list order only if the field is absent.
+    The flag is taken from the record's own ``prev_success`` field, which
+    refers to the previous trial in the same environment; list order is not
+    used, since records from parallel environments interleave.
     """
     rs = [r for r in records if r.get("first_lick_s") is not None
           and r.get("cue_onset_step") is not None]
@@ -1163,13 +1059,7 @@ def _prev_outcome(records):
 
 def plot_history_split_hist(ax, records, *, bin_ms: float = 50.0,
                             smooth: int = 3, recent: Optional[int] = None):
-    """First-lick density split by whether the previous trial was rewarded.
-
-    The expected signature: after reward the agent should lick earlier, after
-    failure it should wait longer. A separation here is evidence the previous
-    trial's outcome is being used; overlapping curves mean the history channels
-    are being ignored.
-    """
+    """First-lick density split by whether the previous trial was rewarded."""
     rs, prev = _prev_outcome(records)
     if recent:
         rs, prev = rs[-recent:], prev[-recent:]
@@ -1197,14 +1087,11 @@ def plot_history_split_hist(ax, records, *, bin_ms: float = 50.0,
 
 def plot_history_effect_over_trials(ax, records, *, window: int = 400,
                                     step: int = 100):
-    """Median lick time after a rewarded vs an unrewarded trial, in moving
-    windows. Shows WHEN in training the trial-history effect appears, which a
-    single pooled histogram cannot."""
+    """Median first-lick time after rewarded and after unrewarded trials, in
+    moving windows over the trial sequence."""
     rs, prev = _prev_outcome(records)
     fl = np.array([r["first_lick_s"] for r in rs], float)
     pv = np.array([p if p is not None else np.nan for p in prev], float)
-    # Shrink the window rather than draw nothing: a short run should still
-    # show its (noisier) history effect instead of an empty axis.
     window = int(min(window, max(40, len(fl) // 3)))
     step = max(1, min(step, window // 2))
     xs, med_r, med_u = [], [], []
@@ -1230,19 +1117,16 @@ def plot_history_effect_over_trials(ax, records, *, window: int = 400,
 
 def history_regression(records, *, window: int = 600, step: int = 150,
                        n_shuffle: int = 200, rng=None):
-    """Regress first-lick time on the previous trial's outcome and latency, in
-    moving windows, against a trial-order shuffle null.
+    """Regress first-lick time on the previous trial's outcome and first-lick
+    time in moving windows, with a trial-order shuffle null.
 
-    Model, per window:  first_lick ~ b0 + b1*prev_rewarded + b2*prev_first_lick
-
-    The null shuffles trial ORDER within the window, which destroys the
-    pairing between a trial and its predecessor while leaving the lick-time
-    distribution and the outcome frequencies untouched. Without it a non-zero
-    coefficient means little: lick times drift over training, and drift alone
-    produces correlations with anything that also drifts.
+    Model, per window: ``first_lick ~ b0 + b1*prev_rewarded + b2*prev_first_lick``.
+    The null permutes trial order within the window, which removes the pairing
+    between a trial and its predecessor while preserving the marginal
+    distributions.
 
     Returns a dict of arrays: ``trial``, ``b_reward``, ``b_prev_lick`` and the
-    2.5/97.5 percentiles of each under the null.
+    2.5 and 97.5 percentiles of each under the null.
     """
     rng = rng or np.random.default_rng(0)
     rs = [r for r in records if r.get("first_lick_s") is not None
@@ -1281,9 +1165,8 @@ def history_regression(records, *, window: int = 600, step: int = 150,
 
 
 def plot_history_regression(ax, records, **kw):
-    """Regression weights over training with the shuffle null as a grey band.
-    A coefficient outside the band is a trial-history effect that trial order
-    shuffling destroys; inside it, the agent is not using the history."""
+    """Regression weights from :func:`history_regression` over the trial
+    sequence, with the shuffle-null interval shaded."""
     r = history_regression(records, **kw)
     if not len(r["trial"]):
         return _style(ax, "trial", "weight (s)", "trial-history regression")
@@ -1303,12 +1186,9 @@ def plot_history_regression(ax, records, **kw):
 
 # ---- the policy readout ---------------------------------------------------
 def stack_readouts(records, *, pre: int = 25, post: int = 100):
-    """(trials x time) array of the policy readout aligned to cue onset.
-
-    The readout is the logit gap, lick minus wait: the single scalar the whole
-    policy is a function of, with P(lick) = sigmoid(gap). Trials are padded with
-    NaN where they are shorter than the window.
-    """
+    """``(trials, time)`` array of the policy readout (lick-minus-wait logit)
+    aligned to cue onset, NaN-padded where a trial is shorter than the window.
+    Returns ``(array, records_used, step_offsets)``."""
     rows, keep = [], []
     for r in records:
         d = r.get("readout")
@@ -1350,13 +1230,8 @@ def plot_readout_heatmap(ax, records, *, pre: int = 25, post: int = 100,
 def plot_readout_blocks(ax, records, *, n_blocks: int = 5,
                         block: Optional[int] = None, pre: int = 25,
                         post: int = 100, dt: float = 0.02):
-    """Mean policy readout per block of trials, dark to light with training.
-
-    This is where a ramp would show up: an agent timing the interval should
-    develop a readout that rises from cue onset and crosses zero (P(lick) = 0.5)
-    near the required delay, and the crossing should move right as the delay
-    grows.
-    """
+    """Mean policy readout per group of trials, dark to light. Zero
+    corresponds to P(lick) = 0.5."""
     A, keep, t = stack_readouts(records, pre=pre, post=post)
     if not len(A):
         return _style(ax, "time from cue (s)", "readout", "readout over training")
@@ -1404,11 +1279,9 @@ def history_dashboard(records, *, figsize=(13, 11), n_blocks: int = 5,
 
 
 def _model_figure(records, name, *, pre: int = 25, post: int = 120):
-    """Network internals for the evaluation trials, using the existing
-    activity plotters: population heatmap, single units, PSTH by lick-time
-    bin, PCA trajectories -- plus the policy readout, which is the RL-specific
-    part (``model_dashboard`` reads the supervised output head, which the
-    actor-critic does not use)."""
+    """Network-internals figure for records carrying hidden states: activity
+    heatmap, example units, PSTH by lick-time tercile, PCA trajectories and
+    the policy readout."""
     import matplotlib.pyplot as plt
     recs = [r for r in records if r.get("hidden") is not None
             and r.get("cue_onset_step") is not None]
@@ -1428,8 +1301,6 @@ def _model_figure(records, name, *, pre: int = 25, post: int = 120):
         if np.isfinite(fl).sum() > 10 else None
 
     fig, axs = plt.subplots(2, 3, figsize=(16, 8))
-    # These take the full (trials, T, N) stack, not a trial average: the
-    # heatmap sorts units on one half of the trials and displays the other.
     plot_activity_heatmap(axs[0, 0], H, t)
     plot_unit_traces(axs[0, 1], H, t)
     plot_psth(axs[0, 2], H, t, groups=groups)
@@ -1443,18 +1314,12 @@ def _model_figure(records, name, *, pre: int = 25, post: int = 120):
 
 
 # --------------------------------------------------------------------------- #
-# 6. The heads -- do the policy and value readouts sharpen, and do they settle?
+# 6. Policy and value heads
 # --------------------------------------------------------------------------- #
 def plot_weight_norms(ax, hist):
-    """Sizes of the four weight blocks against update index.
-
-    ``w_delta`` is the policy readout direction, the difference of the two rows
-    of the policy head. Its norm is the GAIN of the policy: the logit gap is
-    w_delta . h, so this bounds how confident the policy can become for a state
-    of a given size. A policy that sharpens does it either by growing this or by
-    growing the state; the activity penalty forbids the second route, which is
-    why the two curves should be read together.
-    """
+    """Norms of the policy readout direction (the difference of the two rows
+    of the policy head), the value readout and the recurrent and input weight
+    matrices, against update index."""
     x = np.asarray(hist.get("step", []), float)
     for k, c, lab in (("w_delta_norm", OUTCOME_COLORS["rewarded"],
                        r"$\|w_\Delta\|$ (policy readout)"),
@@ -1474,12 +1339,8 @@ def plot_weight_norms(ax, hist):
 
 
 def plot_weight_steps(ax, hist):
-    """Relative size of each update, per parameter block: ||dtheta||/||theta||.
-
-    This is the settling diagnostic. A run that has converged has every curve
-    decaying toward zero; one still being thrown around does not, however good
-    its behaviour looks.
-    """
+    """Relative update size per parameter block, ``||dtheta|| / ||theta||``,
+    against update index."""
     x = np.asarray(hist.get("step", []), float)
     keys = sorted(k for k in hist if k.startswith("d_"))
     import matplotlib.cm as cm
@@ -1498,13 +1359,8 @@ def plot_weight_steps(ax, hist):
 
 
 def plot_readout_direction_drift(ax, snapshots):
-    """Cosine similarity of each readout DIRECTION to its final value.
-
-    Separates two things the norm cannot: a readout that is still growing along
-    a settled direction (this curve at 1.0, the norm still rising) from one
-    whose direction is still being rewritten (this curve below 1.0). The second
-    means the network has not decided what feature it is reading.
-    """
+    """Cosine similarity of the policy and value readout directions to their
+    final values, against update index."""
     if not snapshots:
         return _style(ax, "update", "cosine to final", "readout direction")
     x = [s["step"] for s in snapshots]
@@ -1522,10 +1378,8 @@ def plot_readout_direction_drift(ax, snapshots):
 
 
 def plot_policy_bias(ax, hist, snapshots):
-    """The policy's resting lick drive: the bias difference alone, which is the
-    logit gap the network would produce from a zero state. Plotted with the
-    entropy it implies, so a bias that has run away is visible as an entropy
-    that cannot recover."""
+    """Policy bias difference (the logit gap at zero hidden state) and the
+    mean policy entropy, against update index."""
     if snapshots:
         x = [s["step"] for s in snapshots]
         b = np.array([s["b_delta"] for s in snapshots], float)
@@ -1567,13 +1421,7 @@ def _stack_field(records, key, *, pre=25, post=120):
 def plot_value_traces(ax, records, *, n_blocks: int = 5,
                       block: Optional[int] = None, dt: float = 0.02,
                       pre: int = 25, post: int = 120):
-    """Predicted value aligned to cue, averaged per block of trials.
-
-    The value head estimates the return from here to the end of the trial. If it
-    is doing its job the trace should rise toward the moment water becomes
-    available and drop after the lick; a flat line means the baseline is
-    carrying no information and the advantage is just the return.
-    """
+    """Cue-aligned value estimate, averaged per group of trials."""
     A, t = _stack_field(records, "value", pre=pre, post=post)
     if not len(A):
         return _style(ax, "time from cue (s)", "predicted value", "value head")
@@ -1594,8 +1442,8 @@ def plot_value_traces(ax, records, *, n_blocks: int = 5,
 
 def heads_dashboard(hist, snapshots=None, records=None, *, figsize=(13, 8),
                     title=None, n_blocks: int = 5, block: Optional[int] = None):
-    """Policy and value heads: magnitude, direction, settling, and what the
-    value function actually predicts."""
+    """Policy and value head figure: weight norms, readout direction, policy
+    bias, value gain, value traces and the policy readout."""
     import matplotlib.pyplot as plt
     fig, axs = plt.subplots(2, 3, figsize=figsize)
     plot_weight_norms(axs[0, 0], hist)
